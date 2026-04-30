@@ -1,0 +1,8 @@
+__pycache__/
+*.so
+**/*.dSYM/
+target/
+
+.venv/
+
+__marimo__/

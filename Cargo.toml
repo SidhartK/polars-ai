@@ -1,0 +1,21 @@
+[package]
+name = "polars_ai"
+version = "0.1.0"
+edition = "2021"
+
+[lib]
+name = "polars_ai"
+crate-type = ["cdylib"]
+
+[dependencies]
+pyo3 = { version = "0.26", features = ["extension-module", "abi3-py39"] }
+pyo3-polars = { version = "0.25", features = ["derive", "lazy"] }
+polars = { version = "0.52", features = ["lazy", "dtype-struct", "timezones"] }
+serde = { version = "1", features = ["derive"] }
+serde_json = "1"
+tokio = { version = "1", features = ["rt-multi-thread", "macros", "time"] }
+futures = "0.3"
+governor = "0.6"
+nonzero_ext = "0.3"
+reqwest = { version = "0.12", default-features = false, features = ["json", "rustls-tls"] }
+base64 = "0.22"

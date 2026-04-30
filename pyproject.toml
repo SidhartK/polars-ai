@@ -1,0 +1,24 @@
+[build-system]
+requires = ["maturin>=1.5,<2.0"]
+build-backend = "maturin"
+
+[project]
+name = "polars-ai"
+version = "0.1.0"
+requires-python = ">=3.9"
+dependencies = [
+    "polars>=0.41",
+]
+
+[project.optional-dependencies]
+dev = [
+    "pytest>=7.0",
+]
+examples = [
+    "marimo",
+]
+
+[tool.maturin]
+module-name = "polars_ai._polars_ai"
+python-source = "."
+features = ["pyo3/extension-module"]
