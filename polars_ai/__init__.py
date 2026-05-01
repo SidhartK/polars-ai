@@ -42,7 +42,7 @@ Expression namespaces (validated at ``.collect()`` for plugin calls):
         .ctx.preview(), .ctx.estimate_tokens(),
         .ctx.map(model=..., budgets...), .ctx.cache_key(model)
     ``.ai`` on AiResponse struct columns produced by ``.ctx.map``:
-        .ai.value(), .ai.status(), .ai.hydrate(ctx=..., model=...)
+        .ai.value(), .ai.status(), .ai.telemetry(), .ai.hydrate(ctx=..., model=...)
 
 Model interface:
     pl_ai.AiModel          abstract base class

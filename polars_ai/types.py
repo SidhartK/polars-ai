@@ -50,7 +50,7 @@ _REQUIRED_FIELDS: frozenset[str] = frozenset({"_type", "_value", "_mime", "_meta
 # AiResponse durable result struct — returned by `.ctx.map` / `.ai.hydrate`
 # Bump RESPONSE_SCHEMA_VERSION in Rust (`CACHE_SCHEMA_VERSION`) when changing.
 # ---------------------------------------------------------------------------
-RESPONSE_SCHEMA_VERSION = "1"
+RESPONSE_SCHEMA_VERSION = "2"
 
 DEFAULT_CACHE_FOLDER = "__polars_ai_cache__"
 
@@ -68,6 +68,10 @@ _AI_RESPONSE_FIELDS: tuple[tuple[str, pl.PolarsDataType], ...] = (
     ("model_config", pl.Utf8),
     ("error", pl.Utf8),
     ("attempts", pl.UInt32),
+    ("input_tokens", pl.UInt64),
+    ("output_tokens", pl.UInt64),
+    ("total_tokens", pl.UInt64),
+    ("cost_usd", pl.Float64),
     ("created_at", pl.Utf8),
     ("completed_at", pl.Utf8),
 )

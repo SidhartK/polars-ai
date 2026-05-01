@@ -51,6 +51,16 @@ def test_is_response_dtype_matches_canonical_ai_response() -> None:
     assert pl_ai.is_response_dtype(pl_ai.AiResponse)
 
 
+def test_ai_response_includes_telemetry_fields() -> None:
+    fields = {field.name: field.dtype for field in pl_ai.AiResponse.fields}
+
+    assert pl_ai.RESPONSE_SCHEMA_VERSION == "2"
+    assert fields["input_tokens"] == pl.UInt64
+    assert fields["output_tokens"] == pl.UInt64
+    assert fields["total_tokens"] == pl.UInt64
+    assert fields["cost_usd"] == pl.Float64
+
+
 def test_is_response_dtype_false_plain_utf8() -> None:
     assert not pl_ai.is_response_dtype(pl.Utf8)
 

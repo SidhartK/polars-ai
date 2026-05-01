@@ -22,17 +22,17 @@ def _():
 @app.cell
 def _(mo):
     mo.md("""
-# 03 — Cache across back-to-back calls + hydrate
+    # 03 — Cache across back-to-back calls + hydrate
 
-This notebook shows why **`cache=True`** matters when you:
+    This notebook shows why **`cache=True`** matters when you:
 
-1. **Warm** the JSONL store with a first **`ctx.map`**.
-2. Run a **second map immediately** with **`max_requests=0`** — disk hits return **`cache_hit`**
-   without spending provider budget.
-3. Add **new rows** that are not in the cache — they stay **`budget_exhausted`** until you **hydrate**
-   with a positive **`max_requests`** while keeping the same **`cache_path`**.
+    1. **Warm** the JSONL store with a first **`ctx.map`**.
+    2. Run a **second map immediately** with **`max_requests=0`** — disk hits return **`cache_hit`**
+       without spending provider budget.
+    3. Add **new rows** that are not in the cache — they stay **`budget_exhausted`** until you **hydrate**
+       with a positive **`max_requests`** while keeping the same **`cache_path`**.
 
-The demo directory **`__03_cache_demo__/`** sits beside this file (gitignored) and is reset when you run the setup cell.
+    The demo directory **`__03_cache_demo__/`** sits beside this file (gitignored) and is reset when you run the setup cell.
     """)
     return
 
@@ -42,7 +42,7 @@ def _(Path, shutil):
     CACHE_DIR = Path(__file__).resolve().parent / "__03_cache_demo__"
     shutil.rmtree(CACHE_DIR, ignore_errors=True)
     CACHE_DIR.mkdir(parents=True, exist_ok=True)
-    return CACHE_DIR
+    return (CACHE_DIR,)
 
 
 @app.cell
@@ -79,10 +79,10 @@ def _(CACHE_DIR, FakeModel, mo, pl, pl_ai):
     mo.vstack(
         [
             mo.md("""
-## 1. Warm the cache (first `ctx.map`)
+    ## 1. Warm the cache (first `ctx.map`)
 
-Four distinct payloads — each row performs a **`FakeModel`** call and appends to
-**`cache_entries.jsonl`** inside the cache directory.
+    Four distinct payloads — each row performs a **`FakeModel`** call and appends to
+    **`cache_entries.jsonl`** inside the cache directory.
             """),
             warm_result.select(
                 "label",
@@ -91,11 +91,11 @@ Four distinct payloads — each row performs a **`FakeModel`** call and appends 
             ),
         ]
     )
-    return model, warm_df, warm_result
+    return model, warm_df
 
 
 @app.cell
-def _(CACHE_DIR, model, mo, pl, warm_df):
+def _(CACHE_DIR, mo, model, pl, warm_df):
     """Same contexts, zero request budget — disk replay only."""
 
     replay = (
@@ -118,10 +118,10 @@ def _(CACHE_DIR, model, mo, pl, warm_df):
     mo.vstack(
         [
             mo.md("""
-## 2. Back-to-back call with `max_requests=0`
+    ## 2. Back-to-back call with `max_requests=0`
 
-Because **`cache_hit`** short-circuits before the request budget is charged, every row can
-still resolve even when **`max_requests=0`** — values come straight from disk.
+    Because **`cache_hit`** short-circuits before the request budget is charged, every row can
+    still resolve even when **`max_requests=0`** — values come straight from disk.
             """),
             replay.select(
                 "label",
@@ -131,11 +131,11 @@ still resolve even when **`max_requests=0`** — values come straight from disk.
             mo.md(f"Observed statuses: `{statuses}`"),
         ]
     )
-    return replay
+    return
 
 
 @app.cell
-def _(CACHE_DIR, model, mo, pl, pl_ai, warm_df):
+def _(CACHE_DIR, mo, model, pl, pl_ai, warm_df):
     mixed = pl.concat(
         [
             warm_df,
@@ -173,11 +173,11 @@ def _(CACHE_DIR, model, mo, pl, pl_ai, warm_df):
     mo.vstack(
         [
             mo.md("""
-## 3. Mixed frame — cached rows vs unseen rows
+    ## 3. Mixed frame — cached rows vs unseen rows
 
-We **concat** the original four rows (already on disk) with **two new payloads**.
-With **`max_requests=0`**, cached rows **`cache_hit`**, but unseen rows cannot call the model
-and remain **`budget_exhausted`**.
+    We **concat** the original four rows (already on disk) with **two new payloads**.
+    With **`max_requests=0`**, cached rows **`cache_hit`**, but unseen rows cannot call the model
+    and remain **`budget_exhausted`**.
             """),
             cold_tail.select(
                 "label",
@@ -186,11 +186,11 @@ and remain **`budget_exhausted`**.
             mo.md(f"Status column: `{tail_status}`"),
         ]
     )
-    return cold_tail, mixed
+    return (cold_tail,)
 
 
 @app.cell
-def _(CACHE_DIR, cold_tail, model, mo, pl):
+def _(CACHE_DIR, cold_tail, mo, model, pl):
     hydrated = (
         cold_tail.lazy()
         .with_columns(
@@ -212,10 +212,10 @@ def _(CACHE_DIR, cold_tail, model, mo, pl):
     mo.vstack(
         [
             mo.md("""
-## 4. Hydrate with cache still enabled
+    ## 4. Hydrate with cache still enabled
 
-**`.ai.hydrate`** keeps **`cache_hit` / `ok`** rows intact and spends **`max_requests=2`** only on the
-two exhausted rows. Successful fills are appended to the same JSONL file for future runs.
+    **`.ai.hydrate`** keeps **`cache_hit` / `ok`** rows intact and spends **`max_requests=2`** only on the
+    two exhausted rows. Successful fills are appended to the same JSONL file for future runs.
             """),
             hydrated.select(
                 "label",
@@ -225,7 +225,7 @@ two exhausted rows. Successful fills are appended to the same JSONL file for fut
             mo.md(f"Final statuses: `{final_status}`"),
         ]
     )
-    return hydrated
+    return
 
 
 @app.cell
@@ -250,12 +250,12 @@ def _(CACHE_DIR, mo):
 @app.cell
 def _(mo):
     mo.md("""
-## Done
+    ## Done
 
-**Takeaway:** treat the cache directory as a durable sidecar. Pair it with **hydration** when
-you need to resume partial batches without re-querying rows that already succeeded.
+    **Takeaway:** treat the cache directory as a durable sidecar. Pair it with **hydration** when
+    you need to resume partial batches without re-querying rows that already succeeded.
 
-See **`02_model_parameters_and_hydration.py`** for a full tour of every map / hydrate keyword.
+    See **`02_model_parameters_and_hydration.py`** for a full tour of every map / hydrate keyword.
     """)
     return
 

@@ -26,7 +26,7 @@ use tokio::sync::Semaphore;
 // -----------------------------------------------------------------------------
 // Mirror polars_ai.types (RESPONSE_SCHEMA_VERSION)
 // -----------------------------------------------------------------------------
-const CACHE_SCHEMA_VERSION: &str = "1";
+const CACHE_SCHEMA_VERSION: &str = "2";
 const STAT_OK: &str = "ok";
 const STAT_CACHE_HIT: &str = "cache_hit";
 const STAT_BUDGET_EXHAUSTED: &str = "budget_exhausted";
@@ -63,6 +63,14 @@ struct CacheDiskRow {
     error: Option<String>,
     model_config: String,
     attempts: u32,
+    #[serde(default)]
+    input_tokens: Option<u64>,
+    #[serde(default)]
+    output_tokens: Option<u64>,
+    #[serde(default)]
+    total_tokens: Option<u64>,
+    #[serde(default)]
+    cost_usd: Option<f64>,
     created_at: String,
     completed_at: String,
 }
@@ -84,6 +92,21 @@ struct AiContext {
 #[derive(Debug)]
 struct ModelError(String);
 
+#[derive(Clone, Debug, Default)]
+struct ModelOutput {
+    text: String,
+    input_tokens: Option<u64>,
+    output_tokens: Option<u64>,
+    total_tokens: Option<u64>,
+    cost_usd: Option<f64>,
+}
+
+#[derive(Clone, Debug)]
+struct TokenPricing {
+    input_per_million: f64,
+    output_per_million: f64,
+}
+
 impl From<String> for ModelError {
     fn from(value: String) -> Self {
         Self(value)
@@ -97,7 +120,7 @@ impl From<&str> for ModelError {
 }
 
 trait ModelProvider: Send + Sync {
-    fn call(&self, input: AiContext) -> BoxFuture<'static, Result<String, ModelError>>;
+    fn call(&self, input: AiContext) -> BoxFuture<'static, Result<ModelOutput, ModelError>>;
 }
 
 #[derive(Clone, Debug)]
@@ -107,20 +130,29 @@ struct FakeProvider {
 }
 
 impl ModelProvider for FakeProvider {
-    fn call(&self, input: AiContext) -> BoxFuture<'static, Result<String, ModelError>> {
+    fn call(&self, input: AiContext) -> BoxFuture<'static, Result<ModelOutput, ModelError>> {
         let prompt = self.prompt.clone();
         let tag = self.tag.clone();
         Box::pin(async move {
             tokio::time::sleep(std::time::Duration::from_millis(1)).await;
+            let input_tokens = estimate_tokens(&input);
             let rendered_prompt = prompt.replace("{value}", &input.value);
-            Ok(format!(
+            let text = format!(
                 "[FAKE | tag={} | type={} | input_len={}] prompt=\"{}\" -> output=\"{}...\"",
                 tag,
                 input.typ,
                 input.value.len(),
                 &rendered_prompt[..rendered_prompt.len().min(40)],
                 &input.value[..input.value.len().min(30)],
-            ))
+            );
+            let output_tokens = estimate_text_tokens(&text);
+            Ok(ModelOutput {
+                text,
+                input_tokens: Some(input_tokens),
+                output_tokens: Some(output_tokens),
+                total_tokens: Some(input_tokens.saturating_add(output_tokens)),
+                cost_usd: Some(0.0),
+            })
         })
     }
 }
@@ -135,6 +167,7 @@ struct OpenAiProvider {
     prompt: String,
     model: String,
     options: OpenAiOptions,
+    pricing: Option<TokenPricing>,
     client: reqwest::Client,
 }
 
@@ -170,10 +203,11 @@ fn render_openai_content(ctx: &AiContext, prompt: &str) -> Result<Value, ModelEr
 }
 
 impl ModelProvider for OpenAiProvider {
-    fn call(&self, input: AiContext) -> BoxFuture<'static, Result<String, ModelError>> {
+    fn call(&self, input: AiContext) -> BoxFuture<'static, Result<ModelOutput, ModelError>> {
         let prompt = self.prompt.clone();
         let model = self.model.clone();
         let options = self.options.clone();
+        let pricing = self.pricing.clone();
         let client = self.client.clone();
 
         Box::pin(async move {
@@ -214,7 +248,23 @@ impl ModelProvider for OpenAiProvider {
             let parsed: Value = serde_json::from_str(&body_text)
                 .map_err(|e| ModelError(format!("failed to parse response JSON: {}", e)))?;
 
-            parsed
+            let usage = parsed.get("usage");
+            let input_tokens = usage
+                .and_then(|u| u.get("prompt_tokens"))
+                .and_then(|v| v.as_u64())
+                .or_else(|| Some(estimate_tokens(&input)));
+            let output_tokens = usage
+                .and_then(|u| u.get("completion_tokens"))
+                .and_then(|v| v.as_u64());
+            let total_tokens = usage
+                .and_then(|u| u.get("total_tokens"))
+                .and_then(|v| v.as_u64())
+                .or_else(|| match (input_tokens, output_tokens) {
+                    (Some(i), Some(o)) => Some(i.saturating_add(o)),
+                    _ => None,
+                });
+
+            let text = parsed
                 .get("choices")
                 .and_then(|choices| choices.get(0))
                 .and_then(|choice| choice.get("message"))
@@ -223,9 +273,82 @@ impl ModelProvider for OpenAiProvider {
                 .map(|s| s.to_string())
                 .ok_or_else(|| {
                     ModelError("response did not include choices[0].message.content".to_string())
-                })
+                })?;
+
+            let output_tokens = output_tokens.or_else(|| Some(estimate_text_tokens(&text)));
+            let total_tokens = total_tokens.or_else(|| match (input_tokens, output_tokens) {
+                (Some(i), Some(o)) => Some(i.saturating_add(o)),
+                _ => None,
+            });
+            let cost_usd = calculate_cost_usd(input_tokens, output_tokens, pricing.as_ref());
+
+            Ok(ModelOutput {
+                text,
+                input_tokens,
+                output_tokens,
+                total_tokens,
+                cost_usd,
+            })
         })
     }
+}
+
+fn number_from_config(cfg: &Value, key: &str) -> Option<f64> {
+    cfg.get(key)
+        .and_then(|v| v.as_f64())
+        .or_else(|| {
+            cfg.get("options")
+                .and_then(|o| o.get(key))
+                .and_then(|v| v.as_f64())
+        })
+        .or_else(|| {
+            cfg.get("pricing")
+                .and_then(|p| p.get(key))
+                .and_then(|v| v.as_f64())
+        })
+}
+
+fn pricing_from_config(cfg: &Value) -> Option<TokenPricing> {
+    let input_per_million = number_from_config(cfg, "input_cost_per_1m_tokens")
+        .or_else(|| number_from_config(cfg, "input_cost_per_million_tokens"));
+    let output_per_million = number_from_config(cfg, "output_cost_per_1m_tokens")
+        .or_else(|| number_from_config(cfg, "output_cost_per_million_tokens"));
+
+    match (input_per_million, output_per_million) {
+        (Some(input), Some(output)) => Some(TokenPricing {
+            input_per_million: input,
+            output_per_million: output,
+        }),
+        _ => cfg
+            .get("model")
+            .and_then(|v| v.as_str())
+            .and_then(default_pricing_for_model),
+    }
+}
+
+fn default_pricing_for_model(model: &str) -> Option<TokenPricing> {
+    match model {
+        "gpt-4o-mini" | "gpt-4o-mini-2024-07-18" => Some(TokenPricing {
+            input_per_million: 0.15,
+            output_per_million: 0.60,
+        }),
+        "gpt-4o" | "gpt-4o-2024-08-06" => Some(TokenPricing {
+            input_per_million: 2.50,
+            output_per_million: 10.00,
+        }),
+        _ => None,
+    }
+}
+
+fn calculate_cost_usd(
+    input_tokens: Option<u64>,
+    output_tokens: Option<u64>,
+    pricing: Option<&TokenPricing>,
+) -> Option<f64> {
+    let pricing = pricing?;
+    let input = input_tokens? as f64;
+    let output = output_tokens? as f64;
+    Some((input * pricing.input_per_million + output * pricing.output_per_million) / 1_000_000.0)
 }
 
 fn provider_from_config(cfg: &Value) -> Arc<dyn ModelProvider> {
@@ -255,9 +378,8 @@ fn provider_from_config(cfg: &Value) -> Arc<dyn ModelProvider> {
             Arc::new(OpenAiProvider {
                 prompt,
                 model,
-                options: OpenAiOptions {
-                    max_output_tokens,
-                },
+                options: OpenAiOptions { max_output_tokens },
+                pricing: pricing_from_config(cfg),
                 client: reqwest::Client::new(),
             })
         }
@@ -299,6 +421,11 @@ fn hash_cache_key(model_config: &str, ctx: &AiContext) -> String {
 
 const IMAGE_TOKEN_EST: u64 = 1024;
 
+fn estimate_text_tokens(value: &str) -> u64 {
+    let len = value.chars().count() as u64;
+    ((len + 3) / 4).max(1)
+}
+
 fn estimate_tokens(ctx: &AiContext) -> u64 {
     if matches!(ctx.typ.as_str(), "image" | "image_url" | "image_path") {
         IMAGE_TOKEN_EST
@@ -307,10 +434,7 @@ fn estimate_tokens(ctx: &AiContext) -> u64 {
     } else if ctx.typ == "null" {
         0
     } else {
-        {
-            let len = ctx.value.chars().count() as u64;
-            ((len + 3) / 4).max(1)
-        }
+        estimate_text_tokens(&ctx.value)
     }
 }
 
@@ -329,9 +453,8 @@ fn load_disk_cache(cache_dir: &Path) -> PolarsResult<HashMap<String, CacheDiskRo
     let reader = BufReader::new(f);
     let mut map = HashMap::new();
     for line in reader.lines() {
-        let line = line.map_err(|e| {
-            PolarsError::ComputeError(format!("cache read: {}", e).into())
-        })?;
+        let line =
+            line.map_err(|e| PolarsError::ComputeError(format!("cache read: {}", e).into()))?;
         if line.trim().is_empty() {
             continue;
         }
@@ -358,12 +481,10 @@ fn append_cache_entries(cache_dir: &Path, rows: &[CacheDiskRow]) -> PolarsResult
             PolarsError::ComputeError(format!("cache append {}: {}", path.display(), e).into())
         })?;
     for r in rows {
-        let js = serde_json::to_string(r).map_err(|e| {
-            PolarsError::ComputeError(format!("cache serialize: {}", e).into())
-        })?;
-        writeln!(f, "{}", js).map_err(|e| {
-            PolarsError::ComputeError(format!("cache write: {}", e).into())
-        })?;
+        let js = serde_json::to_string(r)
+            .map_err(|e| PolarsError::ComputeError(format!("cache serialize: {}", e).into()))?;
+        writeln!(f, "{}", js)
+            .map_err(|e| PolarsError::ComputeError(format!("cache write: {}", e).into()))?;
     }
     Ok(())
 }
@@ -405,11 +526,7 @@ fn extract_context_rows(series: &Series) -> PolarsResult<Vec<AiContext>> {
 
         out.push(AiContext {
             typ: t.to_string(),
-            value: if value_is_null {
-                String::new()
-            } else {
-                v
-            },
+            value: if value_is_null { String::new() } else { v },
             mime,
             meta: e.to_string(),
             value_is_null,
@@ -428,6 +545,10 @@ fn ai_response_dtype(_inputs: &[Field]) -> PolarsResult<Field> {
             Field::new("model_config".into(), DataType::String),
             Field::new("error".into(), DataType::String),
             Field::new("attempts".into(), DataType::UInt32),
+            Field::new("input_tokens".into(), DataType::UInt64),
+            Field::new("output_tokens".into(), DataType::UInt64),
+            Field::new("total_tokens".into(), DataType::UInt64),
+            Field::new("cost_usd".into(), DataType::Float64),
             Field::new("created_at".into(), DataType::String),
             Field::new("completed_at".into(), DataType::String),
         ]),
@@ -442,6 +563,10 @@ struct ResponseRowParts {
     model_config: String,
     error: Option<String>,
     attempts: u32,
+    input_tokens: Option<u64>,
+    output_tokens: Option<u64>,
+    total_tokens: Option<u64>,
+    cost_usd: Option<f64>,
     created_at: String,
     completed_at: String,
 }
@@ -463,6 +588,10 @@ fn read_existing_parts(resp_series: &Series, idx: usize) -> PolarsResult<Respons
     let fmc = ss.field_by_name("model_config")?;
     let fer = ss.field_by_name("error")?;
     let fat = ss.field_by_name("attempts")?;
+    let fit = ss.field_by_name("input_tokens")?;
+    let fot = ss.field_by_name("output_tokens")?;
+    let ftt = ss.field_by_name("total_tokens")?;
+    let fcu = ss.field_by_name("cost_usd")?;
     let fcr = ss.field_by_name("created_at")?;
     let fco = ss.field_by_name("completed_at")?;
 
@@ -472,6 +601,10 @@ fn read_existing_parts(resp_series: &Series, idx: usize) -> PolarsResult<Respons
     let mc_s = fmc.str()?;
     let er_s = fer.str()?;
     let at_s = fat.u32()?;
+    let it_s = fit.u64()?;
+    let ot_s = fot.u64()?;
+    let tt_s = ftt.u64()?;
+    let cu_s = fcu.f64()?;
     let cre_s = fcr.str()?;
     let com_s = fco.str()?;
 
@@ -482,6 +615,10 @@ fn read_existing_parts(resp_series: &Series, idx: usize) -> PolarsResult<Respons
         model_config: mc_s.get(idx).unwrap_or("").to_string(),
         error: er_s.get(idx).map(|x| x.to_string()),
         attempts: at_s.get(idx).unwrap_or(0),
+        input_tokens: it_s.get(idx),
+        output_tokens: ot_s.get(idx),
+        total_tokens: tt_s.get(idx),
+        cost_usd: cu_s.get(idx),
         created_at: cre_s.get(idx).unwrap_or("").to_string(),
         completed_at: com_s.get(idx).unwrap_or("").to_string(),
     })
@@ -490,14 +627,18 @@ fn read_existing_parts(resp_series: &Series, idx: usize) -> PolarsResult<Respons
 fn assemble_struct_series(parts: &[ResponseRowParts]) -> PolarsResult<Series> {
     let n = parts.len();
     let statuses: Vec<Option<&str>> = parts.iter().map(|r| Some(r.status.as_str())).collect();
-    let values: Vec<Option<&str>> = parts
-        .iter()
-        .map(|r| r.value.as_deref())
-        .collect();
+    let values: Vec<Option<&str>> = parts.iter().map(|r| r.value.as_deref()).collect();
     let keys: Vec<Option<&str>> = parts.iter().map(|r| Some(r.cache_key.as_str())).collect();
-    let mcfg: Vec<Option<&str>> = parts.iter().map(|r| Some(r.model_config.as_str())).collect();
+    let mcfg: Vec<Option<&str>> = parts
+        .iter()
+        .map(|r| Some(r.model_config.as_str()))
+        .collect();
     let errors: Vec<Option<&str>> = parts.iter().map(|r| r.error.as_deref()).collect();
     let attempts: Vec<u32> = parts.iter().map(|r| r.attempts).collect();
+    let input_tokens: Vec<Option<u64>> = parts.iter().map(|r| r.input_tokens).collect();
+    let output_tokens: Vec<Option<u64>> = parts.iter().map(|r| r.output_tokens).collect();
+    let total_tokens: Vec<Option<u64>> = parts.iter().map(|r| r.total_tokens).collect();
+    let cost_usd: Vec<Option<f64>> = parts.iter().map(|r| r.cost_usd).collect();
     let cr: Vec<Option<&str>> = parts.iter().map(|r| Some(r.created_at.as_str())).collect();
     let co: Vec<Option<&str>> = parts
         .iter()
@@ -511,19 +652,13 @@ fn assemble_struct_series(parts: &[ResponseRowParts]) -> PolarsResult<Series> {
         .collect();
 
     let cols = vec![
-        StringChunked::from_iter_options(
-            PlSmallStr::from_static("status"),
-            statuses.into_iter(),
-        )
+        StringChunked::from_iter_options(PlSmallStr::from_static("status"), statuses.into_iter())
             .into_series(),
         StringChunked::from_iter_options(PlSmallStr::from_static("value"), values.into_iter())
             .into_series(),
         StringChunked::from_iter_options(PlSmallStr::from_static("cache_key"), keys.into_iter())
             .into_series(),
-        StringChunked::from_iter_options(
-            PlSmallStr::from_static("model_config"),
-            mcfg.into_iter(),
-        )
+        StringChunked::from_iter_options(PlSmallStr::from_static("model_config"), mcfg.into_iter())
             .into_series(),
         StringChunked::from_iter_options(PlSmallStr::from_static("error"), errors.into_iter())
             .into_series(),
@@ -532,20 +667,33 @@ fn assemble_struct_series(parts: &[ResponseRowParts]) -> PolarsResult<Series> {
             attempts.into_iter().map(Some),
         )
         .into_series(),
+        ChunkedArray::<UInt64Type>::from_iter_options(
+            PlSmallStr::from_static("input_tokens"),
+            input_tokens.into_iter(),
+        )
+        .into_series(),
+        ChunkedArray::<UInt64Type>::from_iter_options(
+            PlSmallStr::from_static("output_tokens"),
+            output_tokens.into_iter(),
+        )
+        .into_series(),
+        ChunkedArray::<UInt64Type>::from_iter_options(
+            PlSmallStr::from_static("total_tokens"),
+            total_tokens.into_iter(),
+        )
+        .into_series(),
+        ChunkedArray::<Float64Type>::from_iter_options(
+            PlSmallStr::from_static("cost_usd"),
+            cost_usd.into_iter(),
+        )
+        .into_series(),
         StringChunked::from_iter_options(PlSmallStr::from_static("created_at"), cr.into_iter())
             .into_series(),
-        StringChunked::from_iter_options(
-            PlSmallStr::from_static("completed_at"),
-            co.into_iter(),
-        )
+        StringChunked::from_iter_options(PlSmallStr::from_static("completed_at"), co.into_iter())
             .into_series(),
     ];
 
-    StructChunked::from_series(
-        PlSmallStr::from_static("ai_response"),
-        n,
-        cols.iter(),
-    )
+    StructChunked::from_series(PlSmallStr::from_static("ai_response"), n, cols.iter())
         .map(|s| s.into_series())
 }
 
@@ -562,8 +710,7 @@ fn run_engine(
     let limiter_opt = if rate == 0 {
         None
     } else {
-        let q =
-            Quota::per_second(NonZeroU32::new(rate.max(1)).unwrap());
+        let q = Quota::per_second(NonZeroU32::new(rate.max(1)).unwrap());
         Some(Arc::new(RateLimiter::direct(q)))
     };
 
@@ -592,13 +739,11 @@ fn run_engine(
         let key = hash_cache_key(model_config, ctx);
 
         if hydrate {
-            let p_row = prior
-                .and_then(|p| p.get(i))
-                .ok_or_else(|| {
-                    PolarsError::ComputeError(
-                        "`ai_hydrate` prior series length mismatches contexts.".into(),
-                    )
-                })?;
+            let p_row = prior.and_then(|p| p.get(i)).ok_or_else(|| {
+                PolarsError::ComputeError(
+                    "`ai_hydrate` prior series length mismatches contexts.".into(),
+                )
+            })?;
             if is_terminal(&p_row.status) {
                 out[i] = Some(p_row.clone());
                 continue;
@@ -613,6 +758,10 @@ fn run_engine(
                 model_config: model_config.to_string(),
                 error: Some("null _value in AiModelContext".into()),
                 attempts: 0,
+                input_tokens: None,
+                output_tokens: None,
+                total_tokens: None,
+                cost_usd: None,
                 created_at: batch_started.clone(),
                 completed_at: String::new(),
             });
@@ -628,6 +777,10 @@ fn run_engine(
                     model_config: hit.model_config.clone(),
                     error: hit.error.clone(),
                     attempts: hit.attempts,
+                    input_tokens: hit.input_tokens,
+                    output_tokens: hit.output_tokens,
+                    total_tokens: hit.total_tokens,
+                    cost_usd: hit.cost_usd,
                     created_at: hit.created_at.clone(),
                     completed_at: hit.completed_at.clone(),
                 });
@@ -637,8 +790,9 @@ fn run_engine(
 
         let tok_need = estimate_tokens(ctx);
         let mut can_req = max_req_budget.map(|m| used_req < m).unwrap_or(true);
-        let can_tok =
-            max_tok_budget.map(|lim| used_tok.saturating_add(tok_need) <= lim).unwrap_or(true);
+        let can_tok = max_tok_budget
+            .map(|lim| used_tok.saturating_add(tok_need) <= lim)
+            .unwrap_or(true);
 
         if !can_tok {
             can_req = false;
@@ -656,14 +810,17 @@ fn run_engine(
                 model_config: model_config.to_string(),
                 error: None,
                 attempts: 0,
+                input_tokens: None,
+                output_tokens: None,
+                total_tokens: None,
+                cost_usd: None,
                 created_at: batch_started.clone(),
                 completed_at: String::new(),
             });
         }
     }
 
-    let cfg: serde_json::Value =
-        serde_json::from_str(model_config).unwrap_or(Value::Null);
+    let cfg: serde_json::Value = serde_json::from_str(model_config).unwrap_or(Value::Null);
     let provider = provider_from_config(&cfg);
     let model_cfg_arc = Arc::new(model_config.to_string());
     let limiter_arc = limiter_opt;
@@ -673,9 +830,8 @@ fn run_engine(
     let results_map: HashMap<usize, ResponseRowParts> = if jobs.is_empty() {
         HashMap::new()
     } else {
-        let rt = Runtime::new().map_err(|e| {
-            PolarsError::ComputeError(format!("tokio runtime: {}", e).into())
-        })?;
+        let rt = Runtime::new()
+            .map_err(|e| PolarsError::ComputeError(format!("tokio runtime: {}", e).into()))?;
         let sem = Arc::new(Semaphore::new(concurrency));
         let pairs: Vec<(usize, ResponseRowParts)> = rt.block_on(async {
             stream::iter(jobs.into_iter())
@@ -690,16 +846,20 @@ fn run_engine(
                         if let Some(l) = lim {
                             l.until_ready().await;
                         }
-                        let done_t = now_iso();
                         let res = prov.call(ctx).await;
+                        let done_t = now_iso();
                         let row = match res {
-                            Ok(text) => ResponseRowParts {
+                            Ok(output) => ResponseRowParts {
                                 status: STAT_OK.into(),
-                                value: Some(text),
+                                value: Some(output.text),
                                 cache_key: ck,
                                 model_config: (*mc).clone(),
                                 error: None,
                                 attempts: 1,
+                                input_tokens: output.input_tokens,
+                                output_tokens: output.output_tokens,
+                                total_tokens: output.total_tokens,
+                                cost_usd: output.cost_usd,
                                 created_at: batch_ts.clone(),
                                 completed_at: done_t.clone(),
                             },
@@ -710,6 +870,10 @@ fn run_engine(
                                 model_config: (*mc).clone(),
                                 error: Some(e.0),
                                 attempts: 1,
+                                input_tokens: None,
+                                output_tokens: None,
+                                total_tokens: None,
+                                cost_usd: None,
                                 created_at: batch_ts,
                                 completed_at: done_t,
                             },
@@ -733,6 +897,10 @@ fn run_engine(
                 error: row.error.clone(),
                 model_config: row.model_config.clone(),
                 attempts: row.attempts,
+                input_tokens: row.input_tokens,
+                output_tokens: row.output_tokens,
+                total_tokens: row.total_tokens,
+                cost_usd: row.cost_usd,
                 created_at: row.created_at.clone(),
                 completed_at: row.completed_at.clone(),
             });
@@ -746,9 +914,9 @@ fn run_engine(
 
     let mut final_rows: Vec<ResponseRowParts> = Vec::with_capacity(n);
     for slot in out {
-        final_rows.push(slot.ok_or_else(|| {
-            PolarsError::ComputeError("internal: missing response row".into())
-        })?);
+        final_rows.push(
+            slot.ok_or_else(|| PolarsError::ComputeError("internal: missing response row".into()))?,
+        );
     }
 
     assemble_struct_series(&final_rows)
@@ -763,11 +931,10 @@ fn ai_cache_key(inputs: &[Series], kwargs: MapKwargs) -> PolarsResult<Series> {
         .map(|c| hash_cache_key(&kwargs.model_config, c))
         .collect();
     let opts: Vec<Option<&str>> = keys.iter().map(|s| Some(s.as_str())).collect();
-    Ok(StringChunked::from_iter_options(
-        PlSmallStr::from_static("cache_key"),
-        opts.into_iter(),
+    Ok(
+        StringChunked::from_iter_options(PlSmallStr::from_static("cache_key"), opts.into_iter())
+            .into_series(),
     )
-    .into_series())
 }
 
 #[polars_expr(output_type_func=ai_response_dtype)]
@@ -806,4 +973,3 @@ fn _polars_ai(m: &Bound<'_, PyModule>) -> PyResult<()> {
     let _ = m;
     Ok(())
 }
-

@@ -62,6 +62,7 @@ marimo edit examples/01_quickstart.py
 - **`status`** — one of `pl_ai.RESPONSE_STATUS_*` (`ok`, `cache_hit`, `budget_exhausted`, `model_error`, `invalid_context`, …).
 - **`value`** — decoded model text when complete; otherwise may be empty or null depending on outcome.
 - **`cache_key`** — deterministic per row/model row hash (stable across runs).
+- **`input_tokens` / `output_tokens` / `total_tokens` / `cost_usd`** — telemetry returned with every response and persisted in cache entries when caching is enabled.
 - **`error`** / **`attempts`** / timestamps — bookkeeping for debugging and dashboards.
 
 Unpack with the **`.ai`** namespace on response columns:

@@ -40,6 +40,30 @@ def test_ctx_map_fake_model_outputs_per_row_marker() -> None:
     assert vals[1].startswith("[FAKE ")
 
 
+def test_ctx_map_returns_telemetry_without_cache() -> None:
+    model = pl_ai.FakeModel(prompt="Echo: {value}", tag="telemetry")
+    df = (
+        pl.LazyFrame({"msg": ["abcd"]})
+        .with_columns(pl_ai.text_context(pl.col("msg")).alias("ctx"))
+        .with_columns(pl.col("ctx").ctx.map(model=model, cache=False).alias("out"))
+        .collect()
+    )
+
+    row = df.select(
+        pl.col("out").ai.status().alias("status"),
+        pl.col("out").ai.input_tokens().alias("input_tokens"),
+        pl.col("out").ai.output_tokens().alias("output_tokens"),
+        pl.col("out").ai.total_tokens().alias("total_tokens"),
+        pl.col("out").ai.cost_usd().alias("cost_usd"),
+    ).to_dicts()[0]
+
+    assert row["status"] == pl_ai.RESPONSE_STATUS_OK
+    assert row["input_tokens"] == 1
+    assert row["output_tokens"] > 0
+    assert row["total_tokens"] == row["input_tokens"] + row["output_tokens"]
+    assert row["cost_usd"] == 0.0
+
+
 def test_ctx_map_fake_model_preserves_row_order() -> None:
     model = pl_ai.FakeModel(tag="seq")
     rows = ["a", "ab", "abc"]
@@ -204,6 +228,10 @@ def test_disk_cache_returns_cache_hit_on_second_collect_even_with_no_budget(tmp_
 
     assert df2.select(pl.col("out").ai.value()).to_series().item() == df1.select(
         pl.col("out").ai.value()
+    ).to_series().item()
+
+    assert df2.select(pl.col("out").ai.telemetry()).to_series().item() == df1.select(
+        pl.col("out").ai.telemetry()
     ).to_series().item()
 
 

@@ -109,6 +109,10 @@ def _sample_ai_response_expr() -> pl.Expr:
         pl.lit('{"tag":"x"}').alias("model_config"),
         pl.lit(None).cast(pl.Utf8).alias("error"),
         pl.lit(1, dtype=pl.UInt32).alias("attempts"),
+        pl.lit(12, dtype=pl.UInt64).alias("input_tokens"),
+        pl.lit(3, dtype=pl.UInt64).alias("output_tokens"),
+        pl.lit(15, dtype=pl.UInt64).alias("total_tokens"),
+        pl.lit(0.00042, dtype=pl.Float64).alias("cost_usd"),
         pl.lit("2020-01-01T00:00:00Z").alias("created_at"),
         pl.lit("2020-01-01T00:00:01Z").alias("completed_at"),
     ).alias("resp")
@@ -122,6 +126,11 @@ def test_ai_namespace_value_status_on_eager_df() -> None:
         pl.col("resp").ai.error().alias("er"),
         pl.col("resp").ai.cache_key().alias("ck"),
         pl.col("resp").ai.attempts().alias("at"),
+        pl.col("resp").ai.input_tokens().alias("it"),
+        pl.col("resp").ai.output_tokens().alias("ot"),
+        pl.col("resp").ai.total_tokens().alias("tt"),
+        pl.col("resp").ai.cost_usd().alias("cu"),
+        pl.col("resp").ai.telemetry().alias("telemetry"),
         pl.col("resp").ai.completed_at().alias("co"),
         pl.col("resp").ai.is_complete().alias("done"),
     )
@@ -131,6 +140,16 @@ def test_ai_namespace_value_status_on_eager_df() -> None:
     assert row["er"] is None
     assert row["ck"] == "key-1"
     assert row["at"] == 1
+    assert row["it"] == 12
+    assert row["ot"] == 3
+    assert row["tt"] == 15
+    assert row["cu"] == 0.00042
+    assert row["telemetry"] == {
+        "input_tokens": 12,
+        "output_tokens": 3,
+        "total_tokens": 15,
+        "cost_usd": 0.00042,
+    }
     assert row["co"] == "2020-01-01T00:00:01Z"
     assert row["done"] is True
 
@@ -152,6 +171,10 @@ def test_ai_is_complete_budget_exhausted_literal() -> None:
                 pl.lit("{}").alias("model_config"),
                 pl.lit(None).cast(pl.Utf8).alias("error"),
                 pl.lit(0, dtype=pl.UInt32).alias("attempts"),
+                pl.lit(None, dtype=pl.UInt64).alias("input_tokens"),
+                pl.lit(None, dtype=pl.UInt64).alias("output_tokens"),
+                pl.lit(None, dtype=pl.UInt64).alias("total_tokens"),
+                pl.lit(None, dtype=pl.Float64).alias("cost_usd"),
                 pl.lit("t").alias("created_at"),
                 pl.lit("").alias("completed_at"),
             ).alias("resp")

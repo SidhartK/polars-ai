@@ -18,7 +18,7 @@ Available methods
 ~~~~~~~~~~~~~~~~~
     .ctx.preview()         -> pl.Expr[Utf8]    human-readable string
     .ctx.estimate_tokens() -> pl.Expr[UInt32]  rough token estimate
-    .ctx.map(model, ...)    -> AiResponse struct (budget + optional cache)
+    .ctx.map(model, ...)    -> AiResponse struct (budget + telemetry + optional cache)
     .ctx.cache_key(model) -> pl.Expr[Utf8] deterministic key for caching
 """
 

@@ -77,6 +77,26 @@ class AiNamespace:
     def attempts(self) -> pl.Expr:
         return self._expr.struct.field("attempts")
 
+    def input_tokens(self) -> pl.Expr:
+        return self._expr.struct.field("input_tokens")
+
+    def output_tokens(self) -> pl.Expr:
+        return self._expr.struct.field("output_tokens")
+
+    def total_tokens(self) -> pl.Expr:
+        return self._expr.struct.field("total_tokens")
+
+    def cost_usd(self) -> pl.Expr:
+        return self._expr.struct.field("cost_usd")
+
+    def telemetry(self) -> pl.Expr:
+        return pl.struct(
+            self.input_tokens(),
+            self.output_tokens(),
+            self.total_tokens(),
+            self.cost_usd(),
+        )
+
     def completed_at(self) -> pl.Expr:
         return self._expr.struct.field("completed_at")
 
