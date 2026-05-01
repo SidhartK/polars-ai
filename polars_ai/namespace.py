@@ -20,6 +20,7 @@ Available methods
     .ctx.estimate_tokens() -> pl.Expr[UInt32]  rough token estimate
     .ctx.map(model, ...)    -> AiResponse struct (budget + telemetry + optional cache)
     .ctx.cache_key(model) -> pl.Expr[Utf8] deterministic key for caching
+    .ctx.batch()           -> ContextBatch list for grouped aggregation
 """
 
 from __future__ import annotations
@@ -60,6 +61,7 @@ def _map_kw(
     max_tokens: int | None,
     max_concurrency: int | None,
     rate_limit_per_second: int | None,
+    multimodal: bool | None = None,
 ) -> dict[str, Any]:
     resolved_path: str | None
     if cache:
@@ -75,6 +77,18 @@ def _map_kw(
         "cache_enabled": cache,
         "cache_path": resolved_path,
         "rate_limit_per_second": rate_limit_per_second,
+        "multimodal": multimodal,
+    }
+
+
+def _reduce_text_kw(
+    *,
+    text_separator: str,
+    number_text_items: bool,
+) -> dict[str, Any]:
+    return {
+        "text_separator": text_separator,
+        "number_text_items": number_text_items,
     }
 
 
@@ -179,6 +193,15 @@ class CtxNamespace:
             is_elementwise=True,
         )
 
+    def batch(self) -> pl.Expr:
+        """
+        Collect row-level contexts into a ContextBatch.
+
+        Use inside ``group_by(...).agg(...)`` to produce one ordered
+        ``List[AiModelContext]`` per group.
+        """
+        return self._expr.implode()
+
     def map(
         self,
         model: AiModel,
@@ -243,6 +266,147 @@ class CtxNamespace:
         return register_plugin_function(
             plugin_path=_lib_path(),
             function_name="ai_map",
+            args=[self._expr],
+            kwargs=kw,
+            is_elementwise=True,
+        )
+
+    def reduce(
+        self,
+        model: AiModel,
+        *,
+        text_separator: str = "\n\n",
+        number_text_items: bool = False,
+        multimodal: bool = True,
+        max_requests: int | None = None,
+        max_tokens: int | None = None,
+        max_concurrency: int | None = None,
+        cache: bool = False,
+        cache_path: str | None = None,
+        rate_limit_per_second: int | None = None,
+    ) -> pl.Expr:
+        """
+        Compatibility wrapper for grouped text reduction followed by model invocation.
+
+        Prefer ``.ctx.batch().ctxbatch.reduce_text(...).ctx.map(...)`` for new code.
+        """
+        reduced = self.batch().ctxbatch.reduce_text(
+            text_separator=text_separator,
+            number_text_items=number_text_items,
+            multimodal=multimodal,
+        )
+        return reduced.ctx.map(
+            model=model,
+            max_requests=max_requests,
+            max_tokens=max_tokens,
+            max_concurrency=max_concurrency,
+            cache=cache,
+            cache_path=cache_path,
+            rate_limit_per_second=rate_limit_per_second,
+        )
+
+
+@pl.api.register_expr_namespace("ctxbatch")
+class CtxBatchNamespace:
+    """Expression namespace for ContextBatch ``List[AiModelContext]`` columns."""
+
+    def __init__(self, expr: pl.Expr) -> None:
+        self._expr = expr
+
+    def len(self) -> pl.Expr:
+        """Return the number of context atoms in each batch."""
+        return self._expr.list.len()
+
+    def slice(self, offset: int, length: int | None = None) -> pl.Expr:
+        """Slice each batch using Polars list semantics."""
+        return self._expr.list.slice(offset, length)
+
+    def take(self, k: int) -> pl.Expr:
+        """Keep the first *k* atoms from each batch."""
+        if k < 0:
+            raise ValueError("`k` must be >= 0")
+        return self.slice(0, k)
+
+    def reduce_text(
+        self,
+        *,
+        text_separator: str = "\n\n",
+        number_text_items: bool = False,
+        multimodal: bool = True,
+    ) -> pl.Expr:
+        """
+        Collapse a ContextBatch to a single text ContextAtom.
+
+        Text-like atoms are joined in order. Image atoms are rejected unless
+        ``multimodal=False`` is passed, in which case the plugin returns a
+        model-style error when the reduced atom is invoked.
+        """
+        from polars.plugins import register_plugin_function
+
+        if not isinstance(text_separator, str):
+            raise TypeError("`text_separator` must be a str")
+        kw = _reduce_text_kw(
+            text_separator=text_separator,
+            number_text_items=number_text_items,
+        )
+        return register_plugin_function(
+            plugin_path=_lib_path(),
+            function_name="ai_reduce_text",
+            args=[self._expr],
+            kwargs=kw,
+            is_elementwise=True,
+        )
+
+    def cache_key(
+        self,
+        model: AiModel,
+        *,
+        multimodal: bool = True,
+    ) -> pl.Expr:
+        """Deterministic cache key for native batch model invocation."""
+        from polars.plugins import register_plugin_function
+
+        return register_plugin_function(
+            plugin_path=_lib_path(),
+            function_name="ai_batch_cache_key",
+            args=[self._expr],
+            kwargs={"model_config": model.model_config, "multimodal": multimodal},
+            is_elementwise=True,
+        )
+
+    def map(
+        self,
+        model: AiModel,
+        *,
+        multimodal: bool = True,
+        max_requests: int | None = None,
+        max_tokens: int | None = None,
+        max_concurrency: int | None = None,
+        cache: bool = False,
+        cache_path: str | None = None,
+        rate_limit_per_second: int | None = None,
+    ) -> pl.Expr:
+        """Invoke a model once per ContextBatch."""
+        from polars.plugins import register_plugin_function
+
+        if max_requests is not None and max_requests < 0:
+            raise ValueError("`max_requests` must be >= 0 or None")
+        if max_concurrency is not None and max_concurrency < 1:
+            raise ValueError("`max_concurrency` must be >= 1 or None")
+        kw = _map_kw(
+            model=model,
+            cache=cache,
+            cache_path=cache_path,
+            max_requests=max_requests,
+            max_tokens=max_tokens,
+            max_concurrency=max_concurrency,
+            rate_limit_per_second=rate_limit_per_second,
+            multimodal=multimodal,
+        )
+
+        return register_plugin_function(
+            plugin_path=_lib_path(),
+            function_name="ai_batch_map",
             args=[self._expr],
             kwargs=kw,
             is_elementwise=True,

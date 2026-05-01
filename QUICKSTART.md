@@ -1,6 +1,6 @@
 # Quickstart
 
-Install `polars-ai` locally and open [`examples/01_quickstart.py`](examples/01_quickstart.py), a marimo notebook that walks through contexts, **`AiResponse`** structs (`.ai.*` accessors), budgets, hydrate, caching, and optional OpenAI.
+Install `polars-ai` locally and open [`examples/01_quickstart.py`](examples/01_quickstart.py), a marimo notebook that walks through context atoms, context batches, **`AiResponse`** structs (`.ai.*` accessors), budgets, hydrate, caching, and optional OpenAI.
 
 ## Prerequisites
 
@@ -40,16 +40,19 @@ marimo edit examples/01_quickstart.py
 1. **`pl_ai.text_context()`** (`AiModelContext` struct columns) and **`pl_ai.is_context_dtype()`**
 2. **`.ctx.preview()`** / **`.ctx.estimate_tokens()`** (pure Polars helpers)
 3. **`.ctx.map(model=..., max_requests=..., max_tokens=..., cache=...)`** returning **`AiResponse`**
-4. **`.ai.value()`**, **`.ai.status()`**, **`.ai.cache_key()`** on mapped columns
-5. **Hydration**: **`.ai.hydrate(ctx=..., model=..., ...budgets)`** to finish **`budget_exhausted`** rows
-6. Chaining pipelines: rebuild context from **`pl_ai.text_context(pl_col.ai.value())`** between stages
-7. Image contexts (`pl_ai.image_context`) and **`pl_ai.context()`**
-8. Optional OpenAI cells when **`OPENAI_API_KEY`** is set
+4. **`.ctx.batch()`** and **`.ctxbatch.reduce_text()`** for grouped prompts
+5. **`.ctxbatch.map(...)`** for one model call per context batch when the provider supports it
+6. **`.ai.value()`**, **`.ai.status()`**, **`.ai.cache_key()`** on mapped columns
+7. **Hydration**: **`.ai.hydrate(ctx=..., model=..., ...budgets)`** to finish **`budget_exhausted`** rows
+8. Chaining pipelines: rebuild context from **`.ai.to_context()`** between stages
+9. Image contexts (`pl_ai.image_context`) and **`pl_ai.context()`**
+10. Optional OpenAI cells when **`OPENAI_API_KEY`** is set
 
 ## Behavioral notes
 
 - **Budget vs optimizer:** Limits apply to whichever rows Lazy Polars executes after optimization. Projection may skip columns or rows unexpectedly; budgets are safeguards, not a guaranteed bill.
 - **Cache folder:** Relative **`./__polars_ai_cache__`** unless you override **`cache_path`**. Cached hits report **`RESPONSE_STATUS_CACHE_HIT`**.
+- **Context state:** atoms are stored as `Struct`; batches are stored as `List[Struct]`; rendered provider content is internal to model invocation.
 
 ## Optional OpenAI cells
 

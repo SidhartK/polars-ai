@@ -20,7 +20,7 @@ import polars as pl
 # ---------------------------------------------------------------------------
 # The canonical schema
 # ---------------------------------------------------------------------------
-AiModelContext = pl.Struct(
+ContextAtom = pl.Struct(
     [
         pl.Field("_type",  pl.Utf8),
         # "text"        — plain string payload
@@ -43,6 +43,9 @@ AiModelContext = pl.Struct(
         # {"format_str": "Review: {value}"}
     ]
 )
+
+AiModelContext = ContextAtom
+ContextBatch = pl.List(ContextAtom)
 
 _REQUIRED_FIELDS: frozenset[str] = frozenset({"_type", "_value", "_mime", "_meta"})
 
@@ -109,6 +112,16 @@ def is_context_dtype(dtype: pl.PolarsDataType) -> bool:
     return _REQUIRED_FIELDS.issubset(field_names)
 
 
+def is_context_batch_dtype(dtype: pl.PolarsDataType) -> bool:
+    """Return True if *dtype* is a valid ContextBatch List[ContextAtom]."""
+    return isinstance(dtype, pl.List) and is_context_dtype(dtype.inner)
+
+
+def is_context_like_dtype(dtype: pl.PolarsDataType) -> bool:
+    """Return True for either a ContextAtom or ContextBatch dtype."""
+    return is_context_dtype(dtype) or is_context_batch_dtype(dtype)
+
+
 def assert_context_dtype(dtype: pl.PolarsDataType, hint: str = "") -> None:
     """Raise a clear TypeError when a non-context dtype reaches a .ctx method."""
     if not is_context_dtype(dtype):
@@ -116,6 +129,19 @@ def assert_context_dtype(dtype: pl.PolarsDataType, hint: str = "") -> None:
             f"`.ctx` requires an AiModelContext column (got `{dtype}`). "
             f"Use `pl_ai.text_context()`, `pl_ai.image_context()`, or `pl_ai.context()` "
             f"to create one first."
+        )
+        if hint:
+            msg += f"\nHint: {hint}"
+        raise TypeError(msg)
+
+
+def assert_context_batch_dtype(dtype: pl.PolarsDataType, hint: str = "") -> None:
+    """Raise a clear TypeError when a non-batch dtype reaches a .ctxbatch method."""
+    if not is_context_batch_dtype(dtype):
+        msg = (
+            f"`.ctxbatch` requires a ContextBatch column (got `{dtype}`). "
+            f"Use `pl.col(\"...\").ctx.batch()` inside a group aggregation, or "
+            f"construct a `List[AiModelContext]` column first."
         )
         if hint:
             msg += f"\nHint: {hint}"

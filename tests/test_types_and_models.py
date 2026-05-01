@@ -15,6 +15,8 @@ def test_is_context_dtype_true_for_constructed_column() -> None:
         pl_ai.text_context(pl.col("t")).alias("ctx")
     )
     assert pl_ai.is_context_dtype(df["ctx"].dtype)
+    assert df["ctx"].dtype == pl_ai.ContextAtom
+    assert pl_ai.AiModelContext == pl_ai.ContextAtom
 
 
 def test_is_context_dtype_false_for_plain_utf8() -> None:
@@ -45,6 +47,21 @@ def test_is_context_dtype_accepts_extra_fields() -> None:
         ]
     )
     assert pl_ai.is_context_dtype(extended)
+
+
+def test_context_batch_dtype_helpers() -> None:
+    dtype = pl.List(pl_ai.ContextAtom)
+
+    assert dtype == pl_ai.ContextBatch
+    assert pl_ai.is_context_batch_dtype(dtype)
+    assert pl_ai.is_context_like_dtype(pl_ai.ContextAtom)
+    assert pl_ai.is_context_like_dtype(dtype)
+    assert not pl_ai.is_context_batch_dtype(pl.Utf8)
+
+
+def test_assert_context_batch_dtype_raises() -> None:
+    with pytest.raises(TypeError, match="ContextBatch"):
+        pl_ai.assert_context_batch_dtype(pl.Utf8)
 
 
 def test_is_response_dtype_matches_canonical_ai_response() -> None:

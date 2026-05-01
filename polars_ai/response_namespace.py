@@ -97,6 +97,12 @@ class AiNamespace:
             self.cost_usd(),
         )
 
+    def to_context(self, *, format_str: str = "{value}") -> pl.Expr:
+        """Wrap the response value as a text AiModelContext for chained calls."""
+        from .constructors import text_context
+
+        return text_context(self.value(), format_str=format_str)
+
     def completed_at(self) -> pl.Expr:
         return self._expr.struct.field("completed_at")
 

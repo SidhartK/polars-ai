@@ -57,6 +57,32 @@ marimo edit examples/01_quickstart.py
 
 ## Structured responses (`AiResponse`)
 
+## Context Atoms And Batches
+
+`AiModelContext` is the row-level context atom: a semi-opaque `Struct[_type, _value, _mime, _meta]` that can render as text or image provider content. `ContextBatch` is a first-class grouped context represented as `List[AiModelContext]`.
+
+```python
+batched = (
+    pl.LazyFrame({"topic": ["a", "a"], "msg": ["one", "two"]})
+    .with_columns(pl_ai.text_context(pl.col("msg")).alias("ctx"))
+    .group_by("topic", maintain_order=True)
+    .agg(pl.col("ctx").ctx.batch().alias("ctx_batch"))
+)
+
+reduced = batched.with_columns(
+    pl.col("ctx_batch")
+    .ctxbatch.reduce_text(text_separator="\n\n", number_text_items=True)
+    .alias("ctx_reduced")
+)
+```
+
+The intended flow is:
+
+1. `ContextAtom -> ContextBatch` with `.ctx.batch()` in grouped aggregations.
+2. `ContextBatch -> ContextAtom(text)` with `.ctxbatch.reduce_text(...)` when a provider needs one text prompt.
+3. `ContextAtom | ContextBatch -> AiResponse` with `.ctx.map(...)` or `.ctxbatch.map(...)`.
+4. `AiResponse -> ContextAtom` with `.ai.to_context()` for chained model calls.
+
 `.ctx.map(model=…)` produces a **`pl.Struct`** column whose schema matches **`pl_ai.AiResponse`**:
 
 - **`status`** — one of `pl_ai.RESPONSE_STATUS_*` (`ok`, `cache_hit`, `budget_exhausted`, `model_error`, `invalid_context`, …).
@@ -86,7 +112,7 @@ decoded = df.select(
 # downstream map: wrap the decoded string as a NEW context column
 step2_model = pl_ai.FakeModel(prompt="Second pass: {value}", tag="step2")
 piped = (
-    lf.with_columns(pl_ai.text_context(pl.col("ai").ai.value()).alias("ctx2"))
+    lf.with_columns(pl.col("ai").ai.to_context().alias("ctx2"))
     .with_columns(pl.col("ctx2").ctx.map(model=step2_model).alias("step2"))
 )
 piped.collect()

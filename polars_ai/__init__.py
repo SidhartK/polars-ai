@@ -35,6 +35,9 @@ Constructors (return pl.Expr[AiModelContext]):
     pl_ai.context(expr, kind="image", mime=...)
     pl_ai.text_context(expr, format_str=...)
     pl_ai.image_context(expr, mime=...)
+    pl_ai.image_url_context(expr)
+    pl_ai.image_path_context(expr)
+    pl_ai.json_context(expr)
 
 Expression namespaces (validated at ``.collect()`` for plugin calls):
 
@@ -58,7 +61,14 @@ from . import namespace as _namespace  # noqa: F401
 from . import response_namespace as _response_namespace  # noqa: F401
 
 # Constructors
-from .constructors import context, image_context, text_context
+from .constructors import (
+    context,
+    image_context,
+    image_path_context,
+    image_url_context,
+    json_context,
+    text_context,
+)
 
 # Model interface
 from .model import AiModel, FakeModel
@@ -67,6 +77,8 @@ from .model import AiModel, FakeModel
 from .types import (
     AiModelContext,
     AiResponse,
+    ContextAtom,
+    ContextBatch,
     DEFAULT_CACHE_FOLDER,
     RESPONSE_SCHEMA_VERSION,
     RESPONSE_STATUS_BUDGET_EXHAUSTED,
@@ -75,8 +87,12 @@ from .types import (
     RESPONSE_STATUS_MODEL_ERROR,
     RESPONSE_STATUS_OK,
     RESPONSE_STATUS_PENDING,
+    assert_context_dtype,
     assert_response_dtype,
+    assert_context_batch_dtype,
     is_context_dtype,
+    is_context_batch_dtype,
+    is_context_like_dtype,
     is_response_dtype,
 )
 
@@ -85,11 +101,16 @@ __all__ = [
     "context",
     "text_context",
     "image_context",
+    "image_url_context",
+    "image_path_context",
+    "json_context",
     # model
     "AiModel",
     "FakeModel",
     # constants / dtype
     "AiModelContext",
+    "ContextAtom",
+    "ContextBatch",
     "AiResponse",
     "DEFAULT_CACHE_FOLDER",
     "RESPONSE_SCHEMA_VERSION",
@@ -100,6 +121,10 @@ __all__ = [
     "RESPONSE_STATUS_MODEL_ERROR",
     "RESPONSE_STATUS_INVALID_CONTEXT",
     "is_context_dtype",
+    "is_context_batch_dtype",
+    "is_context_like_dtype",
+    "assert_context_dtype",
+    "assert_context_batch_dtype",
     "is_response_dtype",
     "assert_response_dtype",
 ]

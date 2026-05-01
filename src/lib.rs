@@ -53,6 +53,20 @@ struct MapKwargs {
     cache_path: Option<String>,
     #[serde(default)]
     rate_limit_per_second: Option<u32>,
+    #[serde(default)]
+    multimodal: Option<bool>,
+}
+
+#[derive(Deserialize, Debug, Clone)]
+struct ReduceTextKwargs {
+    #[serde(default = "default_text_separator")]
+    text_separator: String,
+    #[serde(default)]
+    number_text_items: bool,
+}
+
+fn default_text_separator() -> String {
+    "\n\n".to_string()
 }
 
 #[derive(Clone, Debug, Serialize, Deserialize)]
@@ -80,13 +94,26 @@ struct CacheDiskRow {
 // -----------------------------------------------------------------------------
 
 #[derive(Clone, Debug)]
-struct AiContext {
+struct AiContextAtom {
     typ: String,
     value: String,
     mime: Option<String>,
     #[allow(dead_code)]
     meta: String,
     value_is_null: bool,
+}
+
+type AiContext = AiContextAtom;
+
+#[derive(Clone, Debug)]
+struct AiContextBatch {
+    items: Vec<AiContextAtom>,
+}
+
+#[derive(Clone, Debug)]
+enum ModelInput {
+    Atom(AiContextAtom),
+    Batch(AiContextBatch),
 }
 
 #[derive(Debug)]
@@ -120,7 +147,7 @@ impl From<&str> for ModelError {
 }
 
 trait ModelProvider: Send + Sync {
-    fn call(&self, input: AiContext) -> BoxFuture<'static, Result<ModelOutput, ModelError>>;
+    fn call(&self, input: ModelInput) -> BoxFuture<'static, Result<ModelOutput, ModelError>>;
 }
 
 #[derive(Clone, Debug)]
@@ -130,20 +157,21 @@ struct FakeProvider {
 }
 
 impl ModelProvider for FakeProvider {
-    fn call(&self, input: AiContext) -> BoxFuture<'static, Result<ModelOutput, ModelError>> {
+    fn call(&self, input: ModelInput) -> BoxFuture<'static, Result<ModelOutput, ModelError>> {
         let prompt = self.prompt.clone();
         let tag = self.tag.clone();
         Box::pin(async move {
             tokio::time::sleep(std::time::Duration::from_millis(1)).await;
-            let input_tokens = estimate_tokens(&input);
-            let rendered_prompt = prompt.replace("{value}", &input.value);
+            let atom = render_fake_input(input)?;
+            let input_tokens = estimate_tokens(&atom);
+            let rendered_prompt = prompt.replace("{value}", &atom.value);
             let text = format!(
                 "[FAKE | tag={} | type={} | input_len={}] prompt=\"{}\" -> output=\"{}...\"",
                 tag,
-                input.typ,
-                input.value.len(),
+                atom.typ,
+                atom.value.len(),
                 &rendered_prompt[..rendered_prompt.len().min(40)],
-                &input.value[..input.value.len().min(30)],
+                &atom.value[..atom.value.len().min(30)],
             );
             let output_tokens = estimate_text_tokens(&text);
             Ok(ModelOutput {
@@ -171,7 +199,104 @@ struct OpenAiProvider {
     client: reqwest::Client,
 }
 
-fn render_openai_content(ctx: &AiContext, prompt: &str) -> Result<Value, ModelError> {
+fn is_text_joinable(typ: &str) -> bool {
+    matches!(typ, "text" | "json" | "blob" | "unknown")
+}
+
+fn reduce_batch_to_text_atom(
+    batch: &AiContextBatch,
+    text_separator: &str,
+    number_text_items: bool,
+) -> AiContextAtom {
+    if batch.items.iter().any(|item| item.value_is_null) {
+        return AiContextAtom {
+            typ: "text".to_string(),
+            value: String::new(),
+            mime: None,
+            meta: json!({"reduction": "text", "error": "null _value in ContextBatch"})
+                .to_string(),
+            value_is_null: true,
+        };
+    }
+
+    if let Some(item) = batch
+        .items
+        .iter()
+        .find(|item| !is_text_joinable(item.typ.as_str()))
+    {
+        return AiContextAtom {
+            typ: "unsupported_batch".to_string(),
+            value: format!(
+                "ContextBatch contains `{}`; use native multimodal batch mapping instead of reduce_text",
+                item.typ
+            ),
+            mime: None,
+            meta: json!({"reduction": "text", "unsupported_type": item.typ}).to_string(),
+            value_is_null: false,
+        };
+    }
+
+    let parts: Vec<String> = batch
+        .items
+        .iter()
+        .enumerate()
+        .map(|(idx, item)| {
+            if number_text_items {
+                format!("Item {}:\n{}", idx + 1, item.value)
+            } else {
+                item.value.clone()
+            }
+        })
+        .collect();
+
+    AiContextAtom {
+        typ: "text".to_string(),
+        value: parts.join(text_separator),
+        mime: None,
+        meta: json!({
+            "reduction": "text",
+            "text_separator": text_separator,
+            "number_text_items": number_text_items
+        })
+        .to_string(),
+        value_is_null: false,
+    }
+}
+
+fn render_fake_input(input: ModelInput) -> Result<AiContextAtom, ModelError> {
+    match input {
+        ModelInput::Atom(ctx) => {
+            if ctx.typ == "unsupported_batch" {
+                Err(ModelError(ctx.value))
+            } else {
+                Ok(ctx)
+            }
+        }
+        ModelInput::Batch(batch) => {
+            if let Some(item) = batch
+                .items
+                .iter()
+                .find(|item| !is_text_joinable(item.typ.as_str()))
+            {
+                return Err(ModelError(format!(
+                    "FakeModel does not support native multimodal ContextBatch item `{}`",
+                    item.typ
+                )));
+            }
+            let atom = reduce_batch_to_text_atom(&batch, "\n\n", false);
+            if atom.typ == "unsupported_batch" {
+                Err(ModelError(atom.value))
+            } else {
+                Ok(AiContextAtom {
+                    typ: "batch".to_string(),
+                    ..atom
+                })
+            }
+        }
+    }
+}
+
+fn render_openai_atom_content(ctx: &AiContextAtom, prompt: &str) -> Result<Value, ModelError> {
     let rendered_prompt = prompt.replace("{value}", &ctx.value);
     let mime = ctx.mime.as_deref().unwrap_or("image/jpeg");
 
@@ -195,6 +320,7 @@ fn render_openai_content(ctx: &AiContext, prompt: &str) -> Result<Value, ModelEr
             {"type": "text", "text": rendered_prompt},
             {"type": "image_url", "image_url": {"url": format!("data:{};base64,{}", mime, ctx.value)}}
         ])),
+        "json" | "blob" | "unknown" => Ok(json!(rendered_prompt)),
         other => Err(ModelError(format!(
             "unsupported AiModelContext _type `{}`",
             other
@@ -202,8 +328,59 @@ fn render_openai_content(ctx: &AiContext, prompt: &str) -> Result<Value, ModelEr
     }
 }
 
+fn render_openai_batch_content(batch: &AiContextBatch, prompt: &str) -> Result<Value, ModelError> {
+    let mut parts: Vec<Value> = Vec::new();
+    let text_value = batch
+        .items
+        .iter()
+        .filter(|item| is_text_joinable(item.typ.as_str()))
+        .map(|item| item.value.as_str())
+        .collect::<Vec<_>>()
+        .join("\n\n");
+    let rendered_prompt = prompt.replace("{value}", &text_value);
+
+    if !rendered_prompt.trim().is_empty() {
+        parts.push(json!({"type": "text", "text": rendered_prompt}));
+    }
+
+    for item in &batch.items {
+        let mime = item.mime.as_deref().unwrap_or("image/jpeg");
+        match item.typ.as_str() {
+            "text" | "json" | "blob" | "unknown" => {}
+            "image_url" => {
+                parts.push(json!({"type": "image_url", "image_url": {"url": item.value}}));
+            }
+            "image_path" => {
+                let bytes = fs::read(&item.value).map_err(|e| {
+                    ModelError(format!("failed to read image path `{}`: {}", item.value, e))
+                })?;
+                let encoded = BASE64_STANDARD.encode(bytes);
+                parts.push(json!({"type": "image_url", "image_url": {"url": format!("data:{};base64,{}", mime, encoded)}}));
+            }
+            "image" => {
+                parts.push(json!({"type": "image_url", "image_url": {"url": format!("data:{};base64,{}", mime, item.value)}}));
+            }
+            other => {
+                return Err(ModelError(format!(
+                    "unsupported AiModelContext _type `{}` in ContextBatch",
+                    other
+                )));
+            }
+        }
+    }
+
+    Ok(json!(parts))
+}
+
+fn render_openai_content(input: &ModelInput, prompt: &str) -> Result<Value, ModelError> {
+    match input {
+        ModelInput::Atom(ctx) => render_openai_atom_content(ctx, prompt),
+        ModelInput::Batch(batch) => render_openai_batch_content(batch, prompt),
+    }
+}
+
 impl ModelProvider for OpenAiProvider {
-    fn call(&self, input: AiContext) -> BoxFuture<'static, Result<ModelOutput, ModelError>> {
+    fn call(&self, input: ModelInput) -> BoxFuture<'static, Result<ModelOutput, ModelError>> {
         let prompt = self.prompt.clone();
         let model = self.model.clone();
         let options = self.options.clone();
@@ -252,7 +429,7 @@ impl ModelProvider for OpenAiProvider {
             let input_tokens = usage
                 .and_then(|u| u.get("prompt_tokens"))
                 .and_then(|v| v.as_u64())
-                .or_else(|| Some(estimate_tokens(&input)));
+                .or_else(|| Some(estimate_model_input(&input)));
             let output_tokens = usage
                 .and_then(|u| u.get("completion_tokens"))
                 .and_then(|v| v.as_u64());
@@ -407,15 +584,30 @@ fn now_iso() -> String {
     Utc::now().to_rfc3339_opts(SecondsFormat::Secs, true)
 }
 
-fn hash_cache_key(model_config: &str, ctx: &AiContext) -> String {
-    let mut hasher = Sha256::new();
-    hasher.update(format!("{}\x00", CACHE_SCHEMA_VERSION).as_bytes());
-    hasher.update(model_config.as_bytes());
+fn hash_atom(hasher: &mut Sha256, ctx: &AiContextAtom) {
     hasher.update(format!("\x00{}\x00{}", ctx.typ, ctx.value).as_bytes());
     if let Some(m) = ctx.mime.as_ref() {
         hasher.update(format!("\x00{}\x00", m).as_bytes());
     }
     hasher.update(ctx.meta.as_bytes());
+}
+
+fn hash_cache_key(model_config: &str, input: &ModelInput) -> String {
+    let mut hasher = Sha256::new();
+    hasher.update(format!("{}\x00", CACHE_SCHEMA_VERSION).as_bytes());
+    hasher.update(model_config.as_bytes());
+    match input {
+        ModelInput::Atom(ctx) => {
+            hasher.update(b"\x00atom");
+            hash_atom(&mut hasher, ctx);
+        }
+        ModelInput::Batch(batch) => {
+            hasher.update(b"\x00batch");
+            for item in &batch.items {
+                hash_atom(&mut hasher, item);
+            }
+        }
+    }
     format!("{:x}", hasher.finalize())
 }
 
@@ -435,6 +627,13 @@ fn estimate_tokens(ctx: &AiContext) -> u64 {
         0
     } else {
         estimate_text_tokens(&ctx.value)
+    }
+}
+
+fn estimate_model_input(input: &ModelInput) -> u64 {
+    match input {
+        ModelInput::Atom(ctx) => estimate_tokens(ctx),
+        ModelInput::Batch(batch) => batch.items.iter().map(estimate_tokens).sum(),
     }
 }
 
@@ -535,6 +734,46 @@ fn extract_context_rows(series: &Series) -> PolarsResult<Vec<AiContext>> {
     Ok(out)
 }
 
+fn extract_context_batches(series: &Series) -> PolarsResult<Vec<AiContextBatch>> {
+    let mut out = Vec::with_capacity(series.len());
+
+    for i in 0..series.len() {
+        match series.get(i)? {
+            AnyValue::List(list_series) => {
+                out.push(AiContextBatch {
+                    items: extract_context_rows(&list_series)?,
+                });
+            }
+            AnyValue::Null => {
+                out.push(AiContextBatch { items: Vec::new() });
+            }
+            other => {
+                return Err(PolarsError::InvalidOperation(
+                    format!(
+                        "`polars-ai` expects a ContextBatch List[AiModelContext], got `{}`.",
+                        other.dtype()
+                    )
+                    .into(),
+                ));
+            }
+        }
+    }
+
+    Ok(out)
+}
+
+fn context_atom_dtype(_inputs: &[Field]) -> PolarsResult<Field> {
+    Ok(Field::new(
+        PlSmallStr::from_static("ai_context"),
+        DataType::Struct(vec![
+            Field::new("_type".into(), DataType::String),
+            Field::new("_value".into(), DataType::String),
+            Field::new("_mime".into(), DataType::String),
+            Field::new("_meta".into(), DataType::String),
+        ]),
+    ))
+}
+
 fn ai_response_dtype(_inputs: &[Field]) -> PolarsResult<Field> {
     Ok(Field::new(
         PlSmallStr::from_static("ai_response"),
@@ -553,6 +792,36 @@ fn ai_response_dtype(_inputs: &[Field]) -> PolarsResult<Field> {
             Field::new("completed_at".into(), DataType::String),
         ]),
     ))
+}
+
+fn assemble_context_series(ctxs: &[AiContextAtom]) -> PolarsResult<Series> {
+    let n = ctxs.len();
+    let typ: Vec<Option<&str>> = ctxs.iter().map(|c| Some(c.typ.as_str())).collect();
+    let value: Vec<Option<&str>> = ctxs
+        .iter()
+        .map(|c| {
+            if c.value_is_null {
+                None
+            } else {
+                Some(c.value.as_str())
+            }
+        })
+        .collect();
+    let mime: Vec<Option<&str>> = ctxs.iter().map(|c| c.mime.as_deref()).collect();
+    let meta: Vec<Option<&str>> = ctxs.iter().map(|c| Some(c.meta.as_str())).collect();
+    let cols = vec![
+        StringChunked::from_iter_options(PlSmallStr::from_static("_type"), typ.into_iter())
+            .into_series(),
+        StringChunked::from_iter_options(PlSmallStr::from_static("_value"), value.into_iter())
+            .into_series(),
+        StringChunked::from_iter_options(PlSmallStr::from_static("_mime"), mime.into_iter())
+            .into_series(),
+        StringChunked::from_iter_options(PlSmallStr::from_static("_meta"), meta.into_iter())
+            .into_series(),
+    ];
+
+    StructChunked::from_series(PlSmallStr::from_static("ai_context"), n, cols.iter())
+        .map(|s| s.into_series())
 }
 
 #[derive(Clone, Debug)]
@@ -698,7 +967,7 @@ fn assemble_struct_series(parts: &[ResponseRowParts]) -> PolarsResult<Series> {
 }
 
 fn run_engine(
-    ctxs: &[AiContext],
+    inputs: &[ModelInput],
     prior: Option<&[ResponseRowParts]>,
     hydrate: bool,
     model_config: &str,
@@ -727,16 +996,16 @@ fn run_engine(
         disk_map = load_disk_cache(dir)?;
     }
 
-    let n = ctxs.len();
+    let n = inputs.len();
     let mut out: Vec<Option<ResponseRowParts>> = vec![None; n];
 
     let mut used_req: usize = 0;
     let mut used_tok: u64 = 0;
-    let mut jobs: Vec<(usize, AiContext, String)> = Vec::new();
+    let mut jobs: Vec<(usize, ModelInput, String)> = Vec::new();
 
     for i in 0..n {
-        let ctx = &ctxs[i];
-        let key = hash_cache_key(model_config, ctx);
+        let input = &inputs[i];
+        let key = hash_cache_key(model_config, input);
 
         if hydrate {
             let p_row = prior.and_then(|p| p.get(i)).ok_or_else(|| {
@@ -750,7 +1019,12 @@ fn run_engine(
             }
         }
 
-        if ctx.value_is_null {
+        let input_is_null = match input {
+            ModelInput::Atom(ctx) => ctx.value_is_null,
+            ModelInput::Batch(batch) => batch.items.iter().any(|item| item.value_is_null),
+        };
+
+        if input_is_null {
             out[i] = Some(ResponseRowParts {
                 status: STAT_INVALID_CTX.into(),
                 value: None,
@@ -788,7 +1062,7 @@ fn run_engine(
             }
         }
 
-        let tok_need = estimate_tokens(ctx);
+        let tok_need = estimate_model_input(input);
         let mut can_req = max_req_budget.map(|m| used_req < m).unwrap_or(true);
         let can_tok = max_tok_budget
             .map(|lim| used_tok.saturating_add(tok_need) <= lim)
@@ -801,7 +1075,7 @@ fn run_engine(
         if can_req {
             used_req += 1;
             used_tok = used_tok.saturating_add(tok_need);
-            jobs.push((i, ctx.clone(), key));
+            jobs.push((i, input.clone(), key));
         } else {
             out[i] = Some(ResponseRowParts {
                 status: STAT_BUDGET_EXHAUSTED.into(),
@@ -928,7 +1202,7 @@ fn ai_cache_key(inputs: &[Series], kwargs: MapKwargs) -> PolarsResult<Series> {
     let ctxs = extract_context_rows(series)?;
     let keys: Vec<String> = ctxs
         .iter()
-        .map(|c| hash_cache_key(&kwargs.model_config, c))
+        .map(|c| hash_cache_key(&kwargs.model_config, &ModelInput::Atom(c.clone())))
         .collect();
     let opts: Vec<Option<&str>> = keys.iter().map(|s| Some(s.as_str())).collect();
     Ok(
@@ -941,8 +1215,56 @@ fn ai_cache_key(inputs: &[Series], kwargs: MapKwargs) -> PolarsResult<Series> {
 fn ai_map(inputs: &[Series], kwargs: MapKwargs) -> PolarsResult<Series> {
     let series = &inputs[0];
     let ctxs = extract_context_rows(series)?;
+    let model_inputs: Vec<ModelInput> = ctxs.into_iter().map(ModelInput::Atom).collect();
     let mc = kwargs.model_config.clone();
-    run_engine(&ctxs, None, false, &mc, &kwargs)
+    run_engine(&model_inputs, None, false, &mc, &kwargs)
+}
+
+#[polars_expr(output_type=String)]
+fn ai_batch_cache_key(inputs: &[Series], kwargs: MapKwargs) -> PolarsResult<Series> {
+    let series = &inputs[0];
+    let batches = extract_context_batches(series)?;
+    let keys: Vec<String> = batches
+        .iter()
+        .map(|batch| hash_cache_key(&kwargs.model_config, &ModelInput::Batch(batch.clone())))
+        .collect();
+    let opts: Vec<Option<&str>> = keys.iter().map(|s| Some(s.as_str())).collect();
+    Ok(
+        StringChunked::from_iter_options(PlSmallStr::from_static("cache_key"), opts.into_iter())
+            .into_series(),
+    )
+}
+
+#[polars_expr(output_type_func=context_atom_dtype)]
+fn ai_reduce_text(inputs: &[Series], kwargs: ReduceTextKwargs) -> PolarsResult<Series> {
+    let batches = extract_context_batches(&inputs[0])?;
+    let ctxs: Vec<AiContextAtom> = batches
+        .iter()
+        .map(|batch| {
+            reduce_batch_to_text_atom(
+                batch,
+                &kwargs.text_separator,
+                kwargs.number_text_items,
+            )
+        })
+        .collect();
+    assemble_context_series(&ctxs)
+}
+
+#[polars_expr(output_type_func=ai_response_dtype)]
+fn ai_batch_map(inputs: &[Series], kwargs: MapKwargs) -> PolarsResult<Series> {
+    let batches = extract_context_batches(&inputs[0])?;
+    let multimodal = kwargs.multimodal.unwrap_or(true);
+    let model_inputs: Vec<ModelInput> = if multimodal {
+        batches.into_iter().map(ModelInput::Batch).collect()
+    } else {
+        batches
+            .iter()
+            .map(|batch| ModelInput::Atom(reduce_batch_to_text_atom(batch, "\n\n", false)))
+            .collect()
+    };
+    let mc = kwargs.model_config.clone();
+    run_engine(&model_inputs, None, false, &mc, &kwargs)
 }
 
 #[polars_expr(output_type_func=ai_response_dtype)]
@@ -960,12 +1282,13 @@ fn ai_hydrate(inputs: &[Series], kwargs: MapKwargs) -> PolarsResult<Series> {
         ));
     }
     let ctxs = extract_context_rows(ctx_series)?;
+    let model_inputs: Vec<ModelInput> = ctxs.into_iter().map(ModelInput::Atom).collect();
     let mut prior_parts = Vec::with_capacity(prior_series.len());
     for i in 0..prior_series.len() {
         prior_parts.push(read_existing_parts(prior_series, i)?);
     }
     let mc = kwargs.model_config.clone();
-    run_engine(&ctxs, Some(&prior_parts), true, &mc, &kwargs)
+    run_engine(&model_inputs, Some(&prior_parts), true, &mc, &kwargs)
 }
 
 #[pymodule]

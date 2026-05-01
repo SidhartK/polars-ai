@@ -72,6 +72,30 @@ def test_context_dispatches_image_with_default_mime() -> None:
     assert out.select(pl.col("ctx").struct.field("_mime")).item() == "image/jpeg"
 
 
+def test_image_url_context_kind() -> None:
+    out = pl.DataFrame({"url": ["https://example.com/a.png"]}).with_columns(
+        pl_ai.image_url_context(pl.col("url")).alias("ctx")
+    )
+    assert out.select(pl.col("ctx").struct.field("_type")).item() == "image_url"
+    assert out.select(pl.col("ctx").struct.field("_value")).item() == "https://example.com/a.png"
+
+
+def test_image_path_context_kind_and_mime() -> None:
+    out = pl.DataFrame({"path": ["example.jpg"]}).with_columns(
+        pl_ai.image_path_context(pl.col("path"), mime="image/jpeg").alias("ctx")
+    )
+    assert out.select(pl.col("ctx").struct.field("_type")).item() == "image_path"
+    assert out.select(pl.col("ctx").struct.field("_mime")).item() == "image/jpeg"
+
+
+def test_json_context_kind_and_mime() -> None:
+    out = pl.DataFrame({"payload": ['{"a": 1}']}).with_columns(
+        pl_ai.json_context(pl.col("payload")).alias("ctx")
+    )
+    assert out.select(pl.col("ctx").struct.field("_type")).item() == "json"
+    assert out.select(pl.col("ctx").struct.field("_mime")).item() == "application/json"
+
+
 def test_context_invalid_kind_raises() -> None:
     with pytest.raises(ValueError, match="kind.*text.*image"):
         pl_ai.context(pl.col("x"), kind="video")  # type: ignore[arg-type]

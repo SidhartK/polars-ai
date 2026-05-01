@@ -74,6 +74,27 @@ def test_estimate_tokens_null_value_returns_null_tokens() -> None:
     assert df["tok"].to_list() == [None]
 
 
+def test_ctx_batch_dtype_after_group_agg() -> None:
+    df = (
+        pl.DataFrame({"g": ["a", "a"], "msg": ["one", "two"]})
+        .with_columns(pl_ai.text_context(pl.col("msg")).alias("ctx"))
+        .group_by("g", maintain_order=True)
+        .agg(pl.col("ctx").ctx.batch().alias("batch"))
+    )
+    assert pl_ai.is_context_batch_dtype(df["batch"].dtype)
+    assert df.select(pl.col("batch").ctxbatch.len()).item() == 2
+
+
+def test_ctxbatch_take_slice_helpers() -> None:
+    df = (
+        pl.DataFrame({"g": ["a", "a", "a"], "msg": ["one", "two", "three"]})
+        .with_columns(pl_ai.text_context(pl.col("msg")).alias("ctx"))
+        .group_by("g", maintain_order=True)
+        .agg(pl.col("ctx").ctx.batch().ctxbatch.take(2).alias("batch"))
+    )
+    assert df.select(pl.col("batch").ctxbatch.len()).item() == 2
+
+
 def test_ctx_map_invalid_max_concurrency_raises() -> None:
     """``.ctx.map`` validates ``max_concurrency`` in Python (no Rust needed)."""
     model = pl_ai.FakeModel()
@@ -133,6 +154,7 @@ def test_ai_namespace_value_status_on_eager_df() -> None:
         pl.col("resp").ai.telemetry().alias("telemetry"),
         pl.col("resp").ai.completed_at().alias("co"),
         pl.col("resp").ai.is_complete().alias("done"),
+        pl.col("resp").ai.to_context().alias("ctx"),
     )
     row = df2.to_dicts()[0]
     assert row["st"] == pl_ai.RESPONSE_STATUS_OK
@@ -152,6 +174,8 @@ def test_ai_namespace_value_status_on_eager_df() -> None:
     }
     assert row["co"] == "2020-01-01T00:00:01Z"
     assert row["done"] is True
+    assert row["ctx"]["_type"] == "text"
+    assert row["ctx"]["_value"] == "hello"
 
 
 def test_ai_namespace_lazy_collect() -> None:
