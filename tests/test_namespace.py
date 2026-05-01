@@ -1,7 +1,8 @@
-"""Tests for `.ctx.preview()` and `.ctx.estimate_tokens()` (no Rust plugin)."""
+"""Tests for `.ctx.preview()`, `.ctx.estimate_tokens()`, and `.ai` helpers."""
 
 from __future__ import annotations
 
+import pytest
 import polars as pl
 
 import polars_ai as pl_ai
@@ -73,6 +74,19 @@ def test_estimate_tokens_null_value_returns_null_tokens() -> None:
     assert df["tok"].to_list() == [None]
 
 
+def test_ctx_map_invalid_max_concurrency_raises() -> None:
+    """``.ctx.map`` validates ``max_concurrency`` in Python (no Rust needed)."""
+    model = pl_ai.FakeModel()
+    with pytest.raises(ValueError, match="max_concurrency"):
+        (
+            pl.LazyFrame({"x": ["a"]})
+            .with_columns(pl_ai.text_context(pl.col("x")).alias("ctx"))
+            .with_columns(
+                pl.col("ctx").ctx.map(model=model, max_concurrency=0).alias("out"),
+            )
+        )
+
+
 def test_namespace_methods_lazy_collect() -> None:
     lf = (
         pl.LazyFrame({"s": ["hi"]})
@@ -85,3 +99,64 @@ def test_namespace_methods_lazy_collect() -> None:
     df = lf.collect()
     assert df["preview"].to_list() == ["hi"]
     assert df["tok"].to_list() == [1]  # ceil(2/4)=1
+
+
+def _sample_ai_response_expr() -> pl.Expr:
+    return pl.struct(
+        pl.lit(pl_ai.RESPONSE_STATUS_OK).alias("status"),
+        pl.lit("hello").alias("value"),
+        pl.lit("key-1").alias("cache_key"),
+        pl.lit('{"tag":"x"}').alias("model_config"),
+        pl.lit(None).cast(pl.Utf8).alias("error"),
+        pl.lit(1, dtype=pl.UInt32).alias("attempts"),
+        pl.lit("2020-01-01T00:00:00Z").alias("created_at"),
+        pl.lit("2020-01-01T00:00:01Z").alias("completed_at"),
+    ).alias("resp")
+
+
+def test_ai_namespace_value_status_on_eager_df() -> None:
+    df = pl.DataFrame({"_": [0]}).select(_sample_ai_response_expr())
+    df2 = df.select(
+        pl.col("resp").ai.status().alias("st"),
+        pl.col("resp").ai.value().alias("vl"),
+        pl.col("resp").ai.error().alias("er"),
+        pl.col("resp").ai.cache_key().alias("ck"),
+        pl.col("resp").ai.attempts().alias("at"),
+        pl.col("resp").ai.completed_at().alias("co"),
+        pl.col("resp").ai.is_complete().alias("done"),
+    )
+    row = df2.to_dicts()[0]
+    assert row["st"] == pl_ai.RESPONSE_STATUS_OK
+    assert row["vl"] == "hello"
+    assert row["er"] is None
+    assert row["ck"] == "key-1"
+    assert row["at"] == 1
+    assert row["co"] == "2020-01-01T00:00:01Z"
+    assert row["done"] is True
+
+
+def test_ai_namespace_lazy_collect() -> None:
+    lf = pl.LazyFrame({"_": [0]}).select(_sample_ai_response_expr())
+    df = lf.with_columns(pl.col("resp").ai.value().alias("v")).collect()
+    assert df["v"].to_list() == ["hello"]
+
+
+def test_ai_is_complete_budget_exhausted_literal() -> None:
+    exh = (
+        pl.DataFrame({"_": [1]})
+        .select(
+            pl.struct(
+                pl.lit(pl_ai.RESPONSE_STATUS_BUDGET_EXHAUSTED).alias("status"),
+                pl.lit(None).cast(pl.Utf8).alias("value"),
+                pl.lit("").alias("cache_key"),
+                pl.lit("{}").alias("model_config"),
+                pl.lit(None).cast(pl.Utf8).alias("error"),
+                pl.lit(0, dtype=pl.UInt32).alias("attempts"),
+                pl.lit("t").alias("created_at"),
+                pl.lit("").alias("completed_at"),
+            ).alias("resp")
+        )
+        .with_columns(pl.col("resp").ai.is_complete().alias("done"))
+    )
+    assert exh["done"].to_list() == [False]
+

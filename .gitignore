@@ -6,3 +6,9 @@ target/
 .venv/
 
 __marimo__/
+
+__polars_ai_cache__/
+
+# Marimo demo notebooks (examples/02_*, examples/03_*)
+examples/__02_param_demo_cache__/
+examples/__03_cache_demo__/

@@ -25,9 +25,13 @@ def _(mo):
     mo.md("""
     # polars-ai quickstart
 
-    This notebook walks through the core `polars_ai` flow: create model contexts,
-    inspect them, map a fake model over them, and optionally call OpenAI if
-    `OPENAI_API_KEY` is set.
+    This notebook walks through the durable AI flow: **`AiModelContext`**
+    structs from `text_context()`, **`.ctx.map()`** yielding **`AiResponse`**
+    (status/value/cache key), budgets, **`.ai.hydrate()`** for partial runs, and
+    optional OpenAI cells when **`OPENAI_API_KEY`** is set.
+
+    Mapped columns are structs — unwrap text with **`pl.col("ai").ai.value()`** before
+    feeding a second-stage model (`text_context` cannot take a struct column).
     """)
     return
 
@@ -138,25 +142,105 @@ def _(FakeModel):
 
 
 @app.cell
-def _(df_ctx, pl, summariser):
-    result = df_ctx.lazy().limit(2).select("id", pl.col("ctx").ctx.map(model=summariser).alias("ai_output"))
+def _(df_ctx, mo, pl, summariser):
+    mapped = (
+        df_ctx.lazy()
+        .with_columns(pl.col("ctx").ctx.map(model=summariser).alias("ai"))
+        .collect()
+    )
 
-    print(result.explain(optimized=True))
+    unpacked = mapped.select(
+        "id",
+        "review",
+        pl.col("ai").ai.status().alias("status"),
+        pl.col("ai").ai.value().alias("summary_text"),
+        pl.col("ai").ai.cache_key().alias("cache_key_preview"),
+    )
+
+    mo.vstack(
+        [
+            mo.md("""
+    ## 4. `ctx.map()` returns `AiResponse`
+
+    Each row under `ai` is an **`AiResponse`** struct (`status`, `value`, caching
+    fields, timestamps). Inspect it with **`pl.col(\"ai\").ai.*`** — here we pull
+    human-readable **`summary_text`** and the row **`status`** (`ok`,
+    `budget_exhausted`, `cache_hit`, …).
+            """),
+            unpacked,
+            mo.md(
+                "`pl_ai.DEFAULT_CACHE_FOLDER` is `__polars_ai_cache__` when disk "
+                "caching is enabled via `cache=True` on `.ctx.map` / `.ai.hydrate`."
+            ),
+        ]
+    )
     return
 
 
 @app.cell
 def _(df_ctx, mo, pl, summariser):
-    result = (
-        df_ctx.lazy()
-        .with_columns(pl.col("ctx").ctx.map(model=summariser).alias("ai_output"))
+    capped = (
+        df_ctx.head(5)
+        .lazy()
+        .with_columns(pl.col("ctx").ctx.map(model=summariser, max_requests=2).alias("ai"))
         .collect()
     )
 
+    statuses = capped.select(pl.col("ai").ai.status()).to_series().to_list()
+
     mo.vstack(
         [
-            mo.md("## 4. `ctx.map()` with `FakeModel`"),
-            result.select("id", "review", "ai_output"),
+            mo.md("""
+    ## 5. Budgets (`max_requests`, `max_tokens`, …)
+
+    `max_requests` caps provider completions across the frame (after cache hits row
+    budget is not reused). Rows past the threshold keep struct columns with status
+    **`budget_exhausted`** so you can filter or hydrate later.
+
+    This slice has five reviews but only **`max_requests=2`** succeeds in order.
+    Statuses: `{}`.
+            """.format(statuses)),
+            capped.select(
+                "id",
+                "review",
+                pl.col("ai").ai.status().alias("status"),
+                pl.col("ai").ai.value().alias("value"),
+            ),
+        ]
+    )
+    return (capped,)
+
+
+@app.cell
+def _(capped, mo, pl, summariser):
+    hydrated = (
+        capped.lazy()
+        .with_columns(
+            pl.col("ai")
+            .ai.hydrate(ctx=pl.col("ctx"), model=summariser, max_requests=10)
+            .alias("ai")
+        )
+        .collect()
+    )
+
+    final_statuses = hydrated.select(pl.col("ai").ai.status()).to_series().to_list()
+
+    mo.vstack(
+        [
+            mo.md("""
+    ## 6. Hydration (`pl.col(\"ai\").ai.hydrate`)
+
+    Reattach the **`ctx`** column and call **`.hydrate`** with a fresh budget. Rows
+    already terminal (`ok`, `cache_hit`, …) are left unchanged.
+
+    After raising the budget (`max_requests=10`), statuses are `{}`.
+            """.format(final_statuses)),
+            hydrated.select(
+                "id",
+                "review",
+                pl.col("ai").ai.status().alias("status"),
+                pl.col("ai").ai.value().alias("value"),
+            ),
         ]
     )
     return
@@ -174,16 +258,30 @@ def _(df, mo, pl, pl_ai, step1, step2):
     chained = (
         df.lazy()
         .with_columns(pl_ai.text_context(pl.col("review")).alias("ctx"))
-        .with_columns(pl.col("ctx").ctx.map(model=step1).alias("summary"))
-        .with_columns(pl_ai.text_context(pl.col("summary")).alias("summary_ctx"))
-        .with_columns(pl.col("summary_ctx").ctx.map(model=step2).alias("sentiment"))
+        .with_columns(pl.col("ctx").ctx.map(model=step1).alias("summary_struct"))
+        .with_columns(
+            pl_ai.text_context(pl.col("summary_struct").ai.value()).alias("summary_ctx")
+        )
+        .with_columns(pl.col("summary_ctx").ctx.map(model=step2).alias("sentiment_struct"))
         .collect()
+    )
+
+    chained_display = chained.select(
+        "id",
+        "review",
+        pl.col("summary_struct").ai.value().alias("summary"),
+        pl.col("sentiment_struct").ai.value().alias("sentiment"),
     )
 
     mo.vstack(
         [
-            mo.md("## 5. Chained `ctx.map()` calls"),
-            chained.select("id", "review", "summary", "sentiment"),
+            mo.md("""
+    ## 7. Chained `ctx.map()` calls
+
+    Intermediate columns are structs. Build the next **`text_context`** from
+    **`pl.col(\"summary_struct\").ai.value()`**, not from the bare struct column.
+            """),
+            chained_display,
         ]
     )
     return
@@ -197,7 +295,7 @@ def _(df, mo, pl, pl_ai):
 
     mo.vstack(
         [
-            mo.md("## 6. Image context struct shape"),
+            mo.md("## 8. Image context struct shape"),
             df_img.select("img_ctx").head(2),
             mo.md(f"`img_ctx` dtype: `{df_img['img_ctx'].dtype}`"),
         ]
@@ -218,16 +316,16 @@ def _(OpenAIModel, df_ctx, df_img, mo, os, pl):
         )
 
         openai_text = (
-            df_ctx.head(2)
-            .lazy()
+            df_ctx.lazy()
+            .limit(2)
             .with_columns(
                 pl.col("ctx").ctx.map(model=openai_text_model).alias("openai_summary")
             )
             .collect()
         )
         openai_images = (
-            df_img.head(2)
-            .lazy()
+            df_img.lazy()
+            .limit(2)
             .with_columns(
                 pl.col("img_ctx")
                 .ctx.map(model=openai_image_model)
@@ -237,18 +335,27 @@ def _(OpenAIModel, df_ctx, df_img, mo, os, pl):
         )
         openai_output = mo.vstack(
             [
-                mo.md("## 7. OpenAI examples"),
+                mo.md("## 9. OpenAI examples"),
                 mo.md("### Text input"),
-                openai_text.select("id", "review", "openai_summary"),
+                openai_text.select(
+                    "id",
+                    "review",
+                    pl.col("openai_summary").ai.value().alias("summary_text"),
+                    pl.col("openai_summary").ai.status().alias("status"),
+                ),
                 mo.md("### Base64 image input"),
-                openai_images.select("id", "openai_image_description"),
+                openai_images.select(
+                    "id",
+                    pl.col("openai_image_description").ai.value().alias("caption"),
+                    pl.col("openai_image_description").ai.status().alias("status"),
+                ),
             ]
         )
     else:
         openai_text = None
         openai_images = None
         openai_output = mo.md(
-            "## 7. OpenAI examples\n\nSkipping because `OPENAI_API_KEY` is not set."
+            "## 9. OpenAI examples\n\nSkipping because `OPENAI_API_KEY` is not set."
         )
 
     openai_output
@@ -265,7 +372,7 @@ def _(df, mo, pl, pl_ai):
 
     mo.vstack(
         [
-            mo.md("## 8. `pl_ai.context()` convenience wrapper"),
+            mo.md("## 10. `pl_ai.context()` convenience wrapper"),
             df_mixed.select("ctx2").head(2),
         ]
     )
@@ -279,6 +386,10 @@ def _(EXAMPLE_IMAGE_PATH, mo):
 
     All quickstart cells completed. The image example uses
     `{EXAMPLE_IMAGE_PATH.relative_to(EXAMPLE_IMAGE_PATH.parents[2])}`.
+
+    **Next:** open `examples/02_model_parameters_and_hydration.py` for a walkthrough of every
+    `.ctx.map` / `.ai.hydrate` parameter (budgets, concurrency, rate limit, cache) and more hydration patterns
+    (`marimo edit examples/02_model_parameters_and_hydration.py`).
     """)
     return
 

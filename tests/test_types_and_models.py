@@ -4,6 +4,7 @@ from __future__ import annotations
 
 import json
 
+import pytest
 import polars as pl
 
 import polars_ai as pl_ai
@@ -46,6 +47,48 @@ def test_is_context_dtype_accepts_extra_fields() -> None:
     assert pl_ai.is_context_dtype(extended)
 
 
+def test_is_response_dtype_matches_canonical_ai_response() -> None:
+    assert pl_ai.is_response_dtype(pl_ai.AiResponse)
+
+
+def test_is_response_dtype_false_plain_utf8() -> None:
+    assert not pl_ai.is_response_dtype(pl.Utf8)
+
+
+def test_is_response_dtype_false_without_required_field() -> None:
+    missing = pl.Struct(
+        [
+            pl.Field("status", pl.Utf8),
+            pl.Field("value", pl.Utf8),
+            # omit cache_key ...
+        ]
+    )
+    assert not pl_ai.is_response_dtype(missing)
+
+
+def test_is_response_dtype_accepts_extra_fields() -> None:
+    extras = pl.Struct(
+        [pl.Field(f.name, f.dtype) for f in pl_ai.AiResponse.fields]
+        + [pl.Field("extra", pl.Utf8)]
+    )
+    assert pl_ai.is_response_dtype(extras)
+
+
+def test_assert_response_dtype_raises() -> None:
+    with pytest.raises(TypeError):
+        pl_ai.assert_response_dtype(pl.Utf8)
+
+
+def test_status_constants_stable() -> None:
+    """Keep literal strings exported for callers and parquet cache interoperability."""
+    assert pl_ai.RESPONSE_STATUS_OK == "ok"
+    assert pl_ai.RESPONSE_STATUS_CACHE_HIT == "cache_hit"
+    assert pl_ai.RESPONSE_STATUS_PENDING == "pending"
+    assert pl_ai.RESPONSE_STATUS_BUDGET_EXHAUSTED == "budget_exhausted"
+    assert pl_ai.RESPONSE_STATUS_MODEL_ERROR == "model_error"
+    assert pl_ai.RESPONSE_STATUS_INVALID_CONTEXT == "invalid_context"
+
+
 def test_fake_model_model_config_roundtrip() -> None:
     model = pl_ai.FakeModel(prompt="Say: {value}", tag="t1")
     cfg = json.loads(model.model_config)
@@ -57,3 +100,4 @@ def test_fake_model_defaults_in_config() -> None:
     cfg = json.loads(model.model_config)
     assert cfg["prompt"] == "Process: {value}"
     assert cfg["tag"] == "fake"
+

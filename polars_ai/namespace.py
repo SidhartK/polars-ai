@@ -18,24 +18,26 @@ Available methods
 ~~~~~~~~~~~~~~~~~
     .ctx.preview()         -> pl.Expr[Utf8]    human-readable string
     .ctx.estimate_tokens() -> pl.Expr[UInt32]  rough token estimate
-    .ctx.map(model)        -> pl.Expr[Utf8]    run model over each row
+    .ctx.map(model, ...)    -> AiResponse struct (budget + optional cache)
+    .ctx.cache_key(model) -> pl.Expr[Utf8] deterministic key for caching
 """
 
 from __future__ import annotations
 
-import pathlib
 import importlib.machinery
+import pathlib
+from typing import Any
 
 import polars as pl
 
 from .model import AiModel
+from .types import DEFAULT_CACHE_FOLDER
 
 _IMAGE_TOKEN_ESTIMATE = 1024
 
 # Path to the compiled Rust shared library.
 # maturin installs it alongside the Python package as _polars_ai.so / .pyd.
 _PACKAGE_DIR = pathlib.Path(__file__).parent
-
 
 def _lib_path() -> str:
     for suffix in importlib.machinery.EXTENSION_SUFFIXES:
@@ -47,6 +49,33 @@ def _lib_path() -> str:
         "Could not find the compiled polars-ai plugin. "
         "Run `maturin develop` from the polars-ai directory, then retry."
     )
+
+
+def _map_kw(
+    *,
+    model: AiModel,
+    cache: bool,
+    cache_path: str | None,
+    max_requests: int | None,
+    max_tokens: int | None,
+    max_concurrency: int | None,
+    rate_limit_per_second: int | None,
+) -> dict[str, Any]:
+    resolved_path: str | None
+    if cache:
+        resolved_path = cache_path if cache_path is not None else DEFAULT_CACHE_FOLDER
+    else:
+        resolved_path = None
+
+    return {
+        "model_config": model.model_config,
+        "max_requests": max_requests,
+        "max_tokens": max_tokens,
+        "max_concurrency": max_concurrency,
+        "cache_enabled": cache,
+        "cache_path": resolved_path,
+        "rate_limit_per_second": rate_limit_per_second,
+    }
 
 
 @pl.api.register_expr_namespace("ctx")
@@ -137,37 +166,84 @@ class CtxNamespace:
     # Model invocation
     # ------------------------------------------------------------------
 
-    def map(self, model: AiModel) -> pl.Expr:
-        """
-        Apply *model* to every row of this AiModelContext column.
+    def cache_key(self, model: AiModel) -> pl.Expr:
+        """Deterministic cache key derived from schema version + model_config + ctx payload."""
 
-        Execution is deferred until ``.collect()`` (fully lazy).  At
-        collect time the Rust plugin spins up a Tokio runtime, fans out
-        all rows concurrently, and throttles dispatch with a built-in
-        rate limiter (50 req/s via ``governor``).
+        from polars.plugins import register_plugin_function
+
+        return register_plugin_function(
+            plugin_path=_lib_path(),
+            function_name="ai_cache_key",
+            args=[self._expr],
+            kwargs={"model_config": model.model_config},
+            is_elementwise=True,
+        )
+
+    def map(
+        self,
+        model: AiModel,
+        *,
+        max_requests: int | None = None,
+        max_tokens: int | None = None,
+        max_concurrency: int | None = None,
+        cache: bool = False,
+        cache_path: str | None = None,
+        rate_limit_per_second: int | None = None,
+    ) -> pl.Expr:
+        """
+        Apply *model* to every row (bounded by budgets). Returns an ``AiResponse`` struct.
+
+        Use ``pl.col(\"summary\").ai.value()`` to read textual output once complete.
 
         Parameters
         ----------
-        model:
-            Any :class:`~polars_ai.AiModel` instance.
-            Use :class:`~polars_ai.FakeModel` for development / testing.
+        model :
+            Concrete :class:`~polars_ai.AiModel`.
+        max_requests :
+            Cap on successful provider attempts for this invocation (remaining rows → ``budget_exhausted``).
+        max_tokens :
+            Rough cumulative token ceiling using the same heuristic as ``estimate_tokens()`` per row.
+        max_concurrency :
+            Tokio parallelism cap inside the Rust plugin.
+        cache :
+            If True, reuse ``responses`` stored under ``cache_path``.
+        cache_path :
+            Relative or absolute folder; defaults to ``__polars_ai_cache__`` next to cwd when ``cache=True``.
+        rate_limit_per_second :
+            Default 50 tokens/s via governor; ``0`` disables local rate limiting only.
 
         Returns
         -------
-        pl.Expr[Utf8]
+        pl.Expr structured as ``AiResponse`` (status, value, cache_key, ...).
 
         Example
         -------
         >>> from polars_ai import FakeModel
         >>> model = FakeModel(prompt="Summarise: {value}", tag="v1")
-        >>> df.with_columns(pl.col("ctx").ctx.map(model=model).alias("result"))
+        >>> df.lazy().with_columns(
+        ...     pl.col("ctx").ctx.map(model=model, max_requests=2).alias("result")
+        ... ).collect()
         """
-        from polars.plugins import register_plugin_function  # polars >= 0.41
+        from polars.plugins import register_plugin_function
+
+        if max_requests is not None and max_requests < 0:
+            raise ValueError("`max_requests` must be >= 0 or None")
+        if max_concurrency is not None and max_concurrency < 1:
+            raise ValueError("`max_concurrency` must be >= 1 or None")
+        kw = _map_kw(
+            model=model,
+            cache=cache,
+            cache_path=cache_path,
+            max_requests=max_requests,
+            max_tokens=max_tokens,
+            max_concurrency=max_concurrency,
+            rate_limit_per_second=rate_limit_per_second,
+        )
 
         return register_plugin_function(
             plugin_path=_lib_path(),
             function_name="ai_map",
             args=[self._expr],
-            kwargs={"model_config": model.model_config},
+            kwargs=kw,
             is_elementwise=True,
         )

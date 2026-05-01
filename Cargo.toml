@@ -19,3 +19,5 @@ governor = "0.6"
 nonzero_ext = "0.3"
 reqwest = { version = "0.12", default-features = false, features = ["json", "rustls-tls"] }
 base64 = "0.22"
+sha2 = "0.10"
+chrono = "0.4"

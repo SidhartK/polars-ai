@@ -1,7 +1,6 @@
 # Quickstart
 
-This guide gets `polars-ai` installed locally and opens the marimo notebook in
-`examples/01_quickstart.py`.
+Install `polars-ai` locally and open [`examples/01_quickstart.py`](examples/01_quickstart.py), a marimo notebook that walks through contexts, **`AiResponse`** structs (`.ai.*` accessors), budgets, hydrate, caching, and optional OpenAI.
 
 ## Prerequisites
 
@@ -15,9 +14,9 @@ Install `maturin` into your environment if you do not already have it:
 pip install maturin
 ```
 
-## Set Up A Local Environment
+## Set up a local environment
 
-From the repository root:
+From `polars-ai/` (repository root):
 
 ```bash
 python -m venv .venv
@@ -26,33 +25,37 @@ pip install maturin
 maturin develop --extras examples
 ```
 
-`maturin develop` compiles the Rust extension and installs `polars-ai` into the
-active virtual environment. Re-run it after editing `src/lib.rs`.
+`maturin develop` compiles the Rust extension and installs `polars-ai` into the active virtual environment. Re-run it after editing `src/lib.rs`.
 
-## Open The Notebook
+You can optionally install dev tooling (pytest, ruff, …) via `pip install -e ".[dev]"`.
+
+## Open the notebook
 
 ```bash
 marimo edit examples/01_quickstart.py
 ```
 
-The notebook demonstrates:
+## What you will practice
 
-1. Building text `AiModelContext` columns with `pl_ai.text_context()`
-2. Checking context dtypes with `pl_ai.is_context_dtype()`
-3. Previewing prompts and estimating tokens
-4. Mapping a `FakeModel` over contexts
-5. Chaining multiple model maps
-6. Creating image contexts from `examples/static/example.jpg`
-7. Using the generic `pl_ai.context()` helper
+1. **`pl_ai.text_context()`** (`AiModelContext` struct columns) and **`pl_ai.is_context_dtype()`**
+2. **`.ctx.preview()`** / **`.ctx.estimate_tokens()`** (pure Polars helpers)
+3. **`.ctx.map(model=..., max_requests=..., max_tokens=..., cache=...)`** returning **`AiResponse`**
+4. **`.ai.value()`**, **`.ai.status()`**, **`.ai.cache_key()`** on mapped columns
+5. **Hydration**: **`.ai.hydrate(ctx=..., model=..., ...budgets)`** to finish **`budget_exhausted`** rows
+6. Chaining pipelines: rebuild context from **`pl_ai.text_context(pl_col.ai.value())`** between stages
+7. Image contexts (`pl_ai.image_context`) and **`pl_ai.context()`**
+8. Optional OpenAI cells when **`OPENAI_API_KEY`** is set
 
-## Optional OpenAI Cells
+## Behavioral notes
 
-The quickstart includes OpenAI-backed text and image examples. They are skipped
-unless `OPENAI_API_KEY` is set:
+- **Budget vs optimizer:** Limits apply to whichever rows Lazy Polars executes after optimization. Projection may skip columns or rows unexpectedly; budgets are safeguards, not a guaranteed bill.
+- **Cache folder:** Relative **`./__polars_ai_cache__`** unless you override **`cache_path`**. Cached hits report **`RESPONSE_STATUS_CACHE_HIT`**.
+
+## Optional OpenAI cells
 
 ```bash
 export OPENAI_API_KEY=...
 marimo edit examples/01_quickstart.py
 ```
 
-Without an API key, the notebook still runs the local `FakeModel` examples.
+Without an API key, the notebook skips live calls and relies on **`FakeModel`**.
