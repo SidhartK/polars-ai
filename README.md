@@ -10,6 +10,8 @@ The public API is intentionally small:
 
 ## Install Locally
 
+First make sure that you have [Rust](https://doc.rust-lang.org/cargo/getting-started/installation.html) installed on your machine.
+
 ```bash
 python -m venv .venv
 source .venv/bin/activate
