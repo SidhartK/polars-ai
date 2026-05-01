@@ -107,7 +107,8 @@ Guardrails supported by both `infer(...)` and `hydrate(...)`:
 - `max_concurrency`: maximum in-flight provider calls.
 - `rate_limit_per_second`: local pacing before provider calls.
 
-## Grouped And Multimodal Inputs
+
+<!-- ## Grouped And Multimodal Inputs
 
 Grouped text inference works on ordinary list expressions:
 
@@ -130,7 +131,7 @@ Non-text inputs use `input_type`:
 pl_ai.infer(pl.col("image_url"), model=model, input_type="image_url")
 pl_ai.infer(pl.col("image_b64"), model=model, input_type="image", mime="image/png")
 pl_ai.infer(pl.col("image_path"), model=model, input_type="image_path", mime="image/jpeg")
-```
+``` -->
 
 ## Examples
 
@@ -139,3 +140,57 @@ marimo edit examples/01_quickstart.py
 ```
 
 The examples cover the simple inference path, budgets/cache, hydration, grouped inputs, and image input options.
+
+
+# Architecture 
+
+```mermaid
+sequenceDiagram
+autonumber
+
+actor User
+participant Polars as Polars LazyFrame/Expr
+participant pl_ai as polars_ai.api
+participant Plugin as polars.plugins.register_plugin_function
+participant RustEntry as Rust plugin (ai_infer/ai_hydrate)
+participant Engine as Rust engine::run_engine
+participant Cache as Disk cache (optional)
+participant Provider as Provider impl (from model_config)
+
+User->>Polars: df.lazy().with_columns(pl_ai.infer(pl.col("x"), model=Model))
+Polars->>pl_ai: evaluate Expr pl_ai.infer(...)
+pl_ai->>pl_ai: validate limits + build kwargs (engine_kwargs)
+pl_ai->>Plugin: register_plugin_function(plugin_path, function_name="ai_infer", args, kwargs)
+Plugin->>RustEntry: call ai_infer(series, MapKwargs)
+
+RustEntry->>Engine: run_engine(inputs, prior=None, hydrate=false, model_config, kwargs)
+Engine->>Cache: load cache index (if enabled)
+Engine->>Cache: lookup cache_key per input
+alt cache hit
+  Cache-->>Engine: cached ok/cache_hit row
+else cache miss and budgets allow
+  Engine->>Provider: provider_from_config(model_config)
+  Engine->>Provider: call(ModelInput) (concurrent + rate-limited)
+  Provider-->>Engine: ModelOutput or ModelError
+  Engine->>Cache: append cache entries (if enabled)
+end
+Engine-->>RustEntry: Series(AiResponse struct)
+RustEntry-->>Plugin: return Series
+Plugin-->>Polars: Expr result column
+Polars-->>User: collect() / fetch() returns DataFrame with AiResponse column
+```
+
+# Comparable Packages
+
+## GABRIEL
+
+[GABRIEL](https://github.com/openai/GABRIEL) is a Python toolkit that turns unstructured text, images, and audio into analysis-ready DataFrames by wrapping GPT calls in a library of opinionated research verbs (rate, rank, classify, extract, dedupe, and more) with built-in prompting, batching, retries, and checkpointing.
+
+| Dimension | **GABRIEL** | **polars-ai** |
+|---|---|---|
+| **Mental model** | "A library of *measurements* (rate, rank, classify, extract, dedupe...)" | "A Polars expression that calls a model" |
+| **Data frame** | pandas | Polars (lazy + eager) |
+| **Prompting** | Opinionated, task-specific Jinja templates baked into each verb | One free-form `prompt="...{value}..."` template per `Model` config |
+| **Output shape** | A tidy DataFrame with task-shaped columns (e.g. one column per attribute) | A Polars `Struct` column (`AiResponse`) with `status`, `value`, `cost_usd`, `cache_key`, token counts, timestamps, etc. |
+| **Resumability** | File-based checkpointing in `save_dir` (raw responses on disk, resume by leaving `reset_files=False`) | Content-hashed cache directory + `hydrate(...)` to top up incomplete rows |
+| **Audience** | Social scientists, qual-data analysts | Polars-native data engineers / ML pipelines |
