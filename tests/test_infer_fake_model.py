@@ -70,6 +70,29 @@ def test_budget_and_null_inputs_return_structured_statuses() -> None:
     assert all(isinstance(key, str) and len(key) > 16 for key in df["cache_key"].to_list())
 
 
+def test_chunked_streaming_infer_request_budget_is_global() -> None:
+    chunks = [
+        pl.DataFrame({"msg": [f"chunk-{chunk}-row-{row}" for row in range(4)]})
+        for chunk in range(4)
+    ]
+    df = (
+        pl.concat(chunks, rechunk=False)
+        .lazy()
+        .with_columns(
+            pl_ai.infer(
+                "msg",
+                model=pl_ai.FakeModel(tag="global-budget"),
+                max_requests=1,
+            ).alias("ai")
+        )
+        .collect(engine="streaming")
+    )
+
+    statuses = df.select(pl.col("ai").struct.field("status")).to_series().to_list()
+    assert statuses.count(pl_ai.RESPONSE_STATUS_OK) == 1
+    assert statuses.count(pl_ai.RESPONSE_STATUS_BUDGET_EXHAUSTED) == len(statuses) - 1
+
+
 def test_python_validation_for_budget_knobs() -> None:
     with pytest.raises(ValueError, match="max_requests"):
         pl_ai.infer(pl.col("x"), model=pl_ai.FakeModel(), max_requests=-1)

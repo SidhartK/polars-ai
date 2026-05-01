@@ -32,7 +32,7 @@ def _(Path, shutil):
     cache_dir = Path(__file__).resolve().parent / "__02_cache__"
     shutil.rmtree(cache_dir, ignore_errors=True)
     cache_dir.mkdir(parents=True, exist_ok=True)
-    return cache_dir
+    return (cache_dir,)
 
 
 @app.cell
@@ -64,15 +64,16 @@ def _(cache_dir, mo, pl, pl_ai):
             partial.select(
                 "payload",
                 pl.col("ai").struct.field("status").alias("status"),
-                pl.col("ai").struct.field("value").alias("value"),
+                pl.col("ai").struct.field("cache_key").str.slice(0, 18).alias("cache_key"),
+                pl.col("ai").struct.field("value").alias("value")
             ),
         ]
     )
-    return cache_dir, model, records
+    return model, records
 
 
 @app.cell
-def _(cache_dir, model, mo, pl, pl_ai, records):
+def _(cache_dir, mo, model, pl, pl_ai, records):
     replay = records.with_columns(
         pl_ai.infer(
             "payload",
@@ -87,11 +88,24 @@ def _(cache_dir, model, mo, pl, pl_ai, records):
             mo.md("## Replay completed rows from disk with zero budget"),
             replay.select(
                 "payload",
-                pl.col("ai").struct.field("status").alias("status"),
-                pl.col("ai").struct.field("cache_key").str.slice(0, 18).alias("cache_key"),
+                pl.col("ai").struct.unnest()
             ),
         ]
     )
+    return
+
+
+@app.cell
+def _(mo):
+    mo.md("""
+    ### To see the cache fill completely, **run the above 2 cells again**.
+    Check out `03_hydration_real_dataset.py` to learn about an even better method of completing partial runs!
+    """)
+    return
+
+
+@app.cell
+def _():
     return
 
 

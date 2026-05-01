@@ -50,22 +50,27 @@ def _(mo, pl, pl_ai):
             result.select("id", "review", "ai"),
         ]
     )
-    return result
+    return (result,)
 
 
 @app.cell
 def _(mo, pl, result):
     decoded = result.select(
         "id",
-        pl.col("ai").struct.field("status").alias("status"),
-        pl.col("ai").struct.field("value").alias("value"),
-        pl.col("ai").struct.field("cache_key").str.slice(0, 18).alias("cache_key"),
-        pl.col("ai").struct.field("input_tokens").alias("input_tokens"),
-        pl.col("ai").struct.field("output_tokens").alias("output_tokens"),
-        pl.col("ai").struct.field("cost_usd").alias("cost_usd"),
+        pl.col("ai").struct.unnest()
     )
 
     mo.vstack([mo.md("## Read `AiResponse` fields"), decoded])
+    return
+
+
+@app.cell
+def _(mo):
+    # We want to add some markdown to instruct them to go to 02_budgets_cache.py
+    mo.md("""
+    ### This was an introduction to `polars-ai`. But there's more to explore!
+    To see budgets and cache in action, check out `02_budgets_cache.py`.
+    """)
     return
 
 

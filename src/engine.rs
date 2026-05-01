@@ -1,13 +1,15 @@
 use std::collections::HashMap;
 use std::num::NonZeroU32;
 use std::path::PathBuf;
-use std::sync::Arc;
+use std::sync::atomic::{AtomicU64, Ordering};
+use std::sync::{Arc, Mutex, OnceLock};
+use std::time::{Duration, Instant};
 
 use futures::stream::{self, StreamExt};
-use governor::{Quota, RateLimiter};
+use governor::{DefaultDirectRateLimiter, Quota, RateLimiter};
 use polars::prelude::*;
 use serde_json::Value;
-use tokio::runtime::Runtime;
+use tokio::runtime::{Builder, Runtime};
 use tokio::sync::Semaphore;
 
 use crate::cache::{
@@ -19,6 +21,119 @@ use crate::types::{
     STAT_BUDGET_EXHAUSTED, STAT_CACHE_HIT, STAT_INVALID_CTX, STAT_MODEL_ERROR, STAT_OK,
 };
 
+const RUN_STATE_TTL: Duration = Duration::from_secs(10 * 60);
+
+static RUNTIME: OnceLock<Result<Runtime, String>> = OnceLock::new();
+static RUNS: OnceLock<Mutex<HashMap<String, Arc<RunState>>>> = OnceLock::new();
+static LEGACY_RUN_COUNTER: AtomicU64 = AtomicU64::new(1);
+
+#[derive(Debug)]
+struct Budget {
+    used_req: usize,
+    used_tok: u64,
+}
+
+#[derive(Debug)]
+struct RunState {
+    budget: Mutex<Budget>,
+    semaphore: Arc<Semaphore>,
+    limiter: Option<Arc<DefaultDirectRateLimiter>>,
+    last_used: Mutex<Instant>,
+}
+
+impl RunState {
+    fn new(concurrency: usize, rate: u32) -> Self {
+        let limiter = if rate == 0 {
+            None
+        } else {
+            let quota = Quota::per_second(NonZeroU32::new(rate.max(1)).unwrap());
+            Some(Arc::new(RateLimiter::direct(quota)))
+        };
+
+        Self {
+            budget: Mutex::new(Budget {
+                used_req: 0,
+                used_tok: 0,
+            }),
+            semaphore: Arc::new(Semaphore::new(concurrency)),
+            limiter,
+            last_used: Mutex::new(Instant::now()),
+        }
+    }
+
+    fn touch(&self) {
+        *self.last_used.lock().unwrap_or_else(|e| e.into_inner()) = Instant::now();
+    }
+
+    fn is_expired(&self, now: Instant) -> bool {
+        let last_used = *self.last_used.lock().unwrap_or_else(|e| e.into_inner());
+        now.duration_since(last_used) >= RUN_STATE_TTL
+    }
+
+    fn try_reserve(
+        &self,
+        max_requests: Option<usize>,
+        max_tokens: Option<u64>,
+        tok_need: u64,
+    ) -> bool {
+        let mut budget = self.budget.lock().unwrap_or_else(|e| e.into_inner());
+
+        if max_requests.map(|m| budget.used_req >= m).unwrap_or(false) {
+            return false;
+        }
+        if max_tokens
+            .map(|lim| budget.used_tok.saturating_add(tok_need) > lim)
+            .unwrap_or(false)
+        {
+            return false;
+        }
+
+        budget.used_req += 1;
+        budget.used_tok = budget.used_tok.saturating_add(tok_need);
+        true
+    }
+}
+
+fn global_runtime() -> PolarsResult<&'static Runtime> {
+    match RUNTIME.get_or_init(|| {
+        Builder::new_multi_thread()
+            .worker_threads(2)
+            .enable_all()
+            .build()
+            .map_err(|e| e.to_string())
+    }) {
+        Ok(rt) => Ok(rt),
+        Err(e) => Err(PolarsError::ComputeError(
+            format!("tokio runtime: {}", e).into(),
+        )),
+    }
+}
+
+fn legacy_run_id() -> String {
+    let id = LEGACY_RUN_COUNTER.fetch_add(1, Ordering::Relaxed);
+    format!("legacy-run-{}", id)
+}
+
+fn get_or_create_run_state(kwargs: &MapKwargs) -> Arc<RunState> {
+    let run_id = kwargs.run_id.clone().unwrap_or_else(legacy_run_id);
+    let concurrency = kwargs.max_concurrency.unwrap_or(32).max(1);
+    let rate = kwargs.rate_limit_per_second.unwrap_or(50);
+    let registry = RUNS.get_or_init(|| Mutex::new(HashMap::new()));
+    let mut runs = registry.lock().unwrap_or_else(|e| e.into_inner());
+    let now = Instant::now();
+
+    runs.retain(|_, state| Arc::strong_count(state) > 1 || !state.is_expired(now));
+
+    if let Some(state) = runs.get(&run_id) {
+        state.touch();
+        return Arc::clone(state);
+    }
+
+    let state = Arc::new(RunState::new(concurrency, rate));
+    runs.insert(run_id, Arc::clone(&state));
+    state
+}
+
 pub(crate) fn run_engine(
     inputs: &[ModelInput],
     prior: Option<&[ResponseRowParts]>,
@@ -28,17 +143,10 @@ pub(crate) fn run_engine(
 ) -> PolarsResult<Series> {
     let batch_started = now_iso();
 
-    let rate = kwargs.rate_limit_per_second.unwrap_or(50);
-    let limiter_opt = if rate == 0 {
-        None
-    } else {
-        let q = Quota::per_second(NonZeroU32::new(rate.max(1)).unwrap());
-        Some(Arc::new(RateLimiter::direct(q)))
-    };
-
     let max_req_budget = kwargs.max_requests;
     let max_tok_budget = kwargs.max_tokens;
     let concurrency = kwargs.max_concurrency.unwrap_or(32).max(1);
+    let run_state = get_or_create_run_state(kwargs);
 
     let mut disk_map = HashMap::new();
     let cache_enabled = kwargs.cache_enabled.unwrap_or(false);
@@ -52,8 +160,6 @@ pub(crate) fn run_engine(
     let n = inputs.len();
     let mut out: Vec<Option<ResponseRowParts>> = vec![None; n];
 
-    let mut used_req: usize = 0;
-    let mut used_tok: u64 = 0;
     let mut jobs: Vec<(usize, ModelInput, String)> = Vec::new();
 
     for i in 0..n {
@@ -116,18 +222,7 @@ pub(crate) fn run_engine(
         }
 
         let tok_need = estimate_model_input(input);
-        let mut can_req = max_req_budget.map(|m| used_req < m).unwrap_or(true);
-        let can_tok = max_tok_budget
-            .map(|lim| used_tok.saturating_add(tok_need) <= lim)
-            .unwrap_or(true);
-
-        if !can_tok {
-            can_req = false;
-        }
-
-        if can_req {
-            used_req += 1;
-            used_tok = used_tok.saturating_add(tok_need);
+        if run_state.try_reserve(max_req_budget, max_tok_budget, tok_need) {
             jobs.push((i, input.clone(), key));
         } else {
             out[i] = Some(ResponseRowParts {
@@ -150,27 +245,25 @@ pub(crate) fn run_engine(
     let cfg: serde_json::Value = serde_json::from_str(model_config).unwrap_or(Value::Null);
     let provider = provider_from_config(&cfg);
     let model_cfg_arc = Arc::new(model_config.to_string());
-    let limiter_arc = limiter_opt;
 
     let mut new_cache_writes: Vec<CacheDiskRow> = Vec::new();
 
     let results_map: HashMap<usize, ResponseRowParts> = if jobs.is_empty() {
         HashMap::new()
     } else {
-        let rt = Runtime::new()
-            .map_err(|e| PolarsError::ComputeError(format!("tokio runtime: {}", e).into()))?;
-        let sem = Arc::new(Semaphore::new(concurrency));
+        let rt = global_runtime()?;
+        let run_state = Arc::clone(&run_state);
         let pairs: Vec<(usize, ResponseRowParts)> = rt.block_on(async {
             stream::iter(jobs.into_iter())
                 .map(|(idx, ctx, ck)| {
                     let prov = Arc::clone(&provider);
-                    let lim = limiter_arc.clone();
-                    let sem = Arc::clone(&sem);
+                    let run_state = Arc::clone(&run_state);
                     let mc = Arc::clone(&model_cfg_arc);
                     let batch_ts = batch_started.clone();
                     async move {
-                        let _p = sem.acquire_owned().await.ok();
-                        if let Some(l) = lim {
+                        let semaphore = Arc::clone(&run_state.semaphore);
+                        let _p = semaphore.acquire_owned().await.ok();
+                        if let Some(l) = run_state.limiter.clone() {
                             l.until_ready().await;
                         }
                         let res = prov.call(ctx).await;

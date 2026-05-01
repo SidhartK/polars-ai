@@ -4,6 +4,7 @@ from __future__ import annotations
 
 import importlib.machinery
 import pathlib
+import uuid
 from typing import Any
 
 from .model import Model
@@ -47,6 +48,7 @@ def engine_kwargs(
 ) -> dict[str, Any]:
     cache_enabled, resolved_path = resolve_cache(cache=cache, cache_path=cache_path)
     return {
+        "run_id": uuid.uuid4().hex,
         "model_config": model.model_config,
         "max_requests": max_requests,
         "max_tokens": max_tokens,

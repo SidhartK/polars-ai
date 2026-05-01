@@ -70,7 +70,7 @@ def _(mo, model, partial, pl, pl_ai):
             response="ai",
             input="message",
             model=model,
-            max_requests=10,
+            max_requests=3,
         ).alias("ai")
     )
 
@@ -84,6 +84,17 @@ def _(mo, model, partial, pl, pl_ai):
             ),
         ]
     )
+    return (hydrated,)
+
+
+@app.cell
+def _(hydrated, model, pl_ai):
+    hydrated.with_columns(pl_ai.hydrate(response="ai", input="message", model=model, max_requests=3).alias("ai"))
+    return
+
+
+@app.cell
+def _():
     return
 
 

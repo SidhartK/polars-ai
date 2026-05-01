@@ -19,7 +19,7 @@ def _():
 @app.cell
 def _(mo):
     mo.md("""
-    # 04 - Grouped and multimodal inputs
+    # 05 - Grouped and multimodal inputs
 
     `infer(...)` accepts ordinary strings, grouped `List[String]` expressions,
     and image-like inputs selected with `input_type`.

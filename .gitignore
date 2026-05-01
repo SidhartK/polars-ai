@@ -10,8 +10,11 @@ __marimo__/
 __polars_ai_cache__/
 
 # Marimo demo notebook generated data/cache folders
+examples/__02_cache__/
 examples/__02_param_demo_cache__/
 examples/__03_data__/
 examples/__03_hydration_cache__/
 examples/__03_cache_demo__/
 examples/__04_cache_demo__/
+examples/__04_airbnb_cache__/
+examples/data/

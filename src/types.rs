@@ -16,6 +16,8 @@ pub(crate) const STAT_INVALID_CTX: &str = "invalid_context";
 
 #[derive(Deserialize, Debug, Clone)]
 pub(crate) struct MapKwargs {
+    #[serde(default)]
+    pub(crate) run_id: Option<String>,
     #[serde(rename = "model_config")]
     pub(crate) model_config: String,
     #[serde(default)]
