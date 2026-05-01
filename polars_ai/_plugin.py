@@ -45,6 +45,7 @@ def engine_kwargs(
     text_separator: str,
     number_text_items: bool,
     multimodal: bool,
+    verbose: bool,
 ) -> dict[str, Any]:
     cache_enabled, resolved_path = resolve_cache(cache=cache, cache_path=cache_path)
     return {
@@ -61,4 +62,5 @@ def engine_kwargs(
         "text_separator": text_separator,
         "number_text_items": number_text_items,
         "multimodal": multimodal,
+        "verbose": verbose,
     }

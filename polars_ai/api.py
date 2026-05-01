@@ -23,6 +23,7 @@ def _validate_limits(
     max_concurrency: int | None,
     input_type: str,
     text_separator: str,
+    verbose: bool,
 ) -> None:
     if max_requests is not None and max_requests < 0:
         raise ValueError("`max_requests` must be >= 0 or None")
@@ -35,6 +36,8 @@ def _validate_limits(
         )
     if not isinstance(text_separator, str):
         raise TypeError("`text_separator` must be a string")
+    if not isinstance(verbose, bool):
+        raise TypeError("`verbose` must be a bool")
 
 
 def infer(
@@ -52,6 +55,7 @@ def infer(
     text_separator: str = "\n\n",
     number_text_items: bool = False,
     multimodal: bool = True,
+    verbose: bool = True,
 ) -> pl.Expr:
     """Run model inference over a Polars expression and return an ``AiResponse`` struct."""
 
@@ -60,6 +64,7 @@ def infer(
         max_concurrency=max_concurrency,
         input_type=input_type,
         text_separator=text_separator,
+        verbose=verbose,
     )
     kwargs = engine_kwargs(
         model=model,
@@ -74,6 +79,7 @@ def infer(
         text_separator=text_separator,
         number_text_items=number_text_items,
         multimodal=multimodal,
+        verbose=verbose,
     )
     return register_plugin_function(
         plugin_path=lib_path(),
@@ -100,6 +106,7 @@ def hydrate(
     text_separator: str = "\n\n",
     number_text_items: bool = False,
     multimodal: bool = True,
+    verbose: bool = True,
 ) -> pl.Expr:
     """Complete incomplete ``AiResponse`` rows using the same input/model contract."""
 
@@ -108,6 +115,7 @@ def hydrate(
         max_concurrency=max_concurrency,
         input_type=input_type,
         text_separator=text_separator,
+        verbose=verbose,
     )
     kwargs = engine_kwargs(
         model=model,
@@ -122,6 +130,7 @@ def hydrate(
         text_separator=text_separator,
         number_text_items=number_text_items,
         multimodal=multimodal,
+        verbose=verbose,
     )
     return register_plugin_function(
         plugin_path=lib_path(),

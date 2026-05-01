@@ -70,6 +70,30 @@ def test_budget_and_null_inputs_return_structured_statuses() -> None:
     assert all(isinstance(key, str) and len(key) > 16 for key in df["cache_key"].to_list())
 
 
+def test_verbose_progress_logging_can_be_enabled_and_disabled(
+    capfd: pytest.CaptureFixture[str],
+) -> None:
+    (
+        pl.DataFrame({"msg": ["a", "b"]})
+        .with_columns(
+            pl_ai.infer("msg", model=pl_ai.FakeModel(tag="verbose-on"), verbose=True).alias("ai")
+        )
+    )
+    captured = capfd.readouterr()
+    assert "[polars-ai infer] planned:" in captured.err
+
+    (
+        pl.DataFrame({"msg": ["a", "b"]})
+        .with_columns(
+            pl_ai.infer("msg", model=pl_ai.FakeModel(tag="verbose-off"), verbose=False).alias(
+                "ai"
+            )
+        )
+    )
+    captured = capfd.readouterr()
+    assert "[polars-ai infer]" not in captured.err
+
+
 def test_chunked_streaming_infer_request_budget_is_global() -> None:
     chunks = [
         pl.DataFrame({"msg": [f"chunk-{chunk}-row-{row}" for row in range(4)]})
@@ -98,3 +122,7 @@ def test_python_validation_for_budget_knobs() -> None:
         pl_ai.infer(pl.col("x"), model=pl_ai.FakeModel(), max_requests=-1)
     with pytest.raises(ValueError, match="max_concurrency"):
         pl_ai.infer(pl.col("x"), model=pl_ai.FakeModel(), max_concurrency=0)
+    with pytest.raises(TypeError, match="verbose"):
+        pl_ai.infer(  # type: ignore[arg-type]
+            pl.col("x"), model=pl_ai.FakeModel(), verbose="yes"
+        )

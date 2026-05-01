@@ -22,6 +22,8 @@ use crate::types::{
 };
 
 const RUN_STATE_TTL: Duration = Duration::from_secs(10 * 60);
+const VERBOSE_LOG_INTERVAL: Duration = Duration::from_secs(2);
+const VERBOSE_COMPLETION_INTERVAL: u64 = 10;
 
 static RUNTIME: OnceLock<Result<Runtime, String>> = OnceLock::new();
 static RUNS: OnceLock<Mutex<HashMap<String, Arc<RunState>>>> = OnceLock::new();
@@ -33,9 +35,55 @@ struct Budget {
     used_tok: u64,
 }
 
+#[derive(Debug, Default)]
+struct PlanningCounts {
+    rows_seen: u64,
+    jobs_reserved: u64,
+    cache_hits: u64,
+    budget_exhausted: u64,
+    invalid_context: u64,
+    terminal_preserved: u64,
+}
+
+#[derive(Debug)]
+struct Progress {
+    rows_seen: u64,
+    jobs_reserved: u64,
+    completed: u64,
+    ok: u64,
+    errors: u64,
+    cache_hits: u64,
+    budget_exhausted: u64,
+    invalid_context: u64,
+    terminal_preserved: u64,
+    started: Instant,
+    last_log: Instant,
+    last_logged_completed: u64,
+}
+
+impl Progress {
+    fn new(now: Instant) -> Self {
+        Self {
+            rows_seen: 0,
+            jobs_reserved: 0,
+            completed: 0,
+            ok: 0,
+            errors: 0,
+            cache_hits: 0,
+            budget_exhausted: 0,
+            invalid_context: 0,
+            terminal_preserved: 0,
+            started: now,
+            last_log: now.checked_sub(VERBOSE_LOG_INTERVAL).unwrap_or(now),
+            last_logged_completed: 0,
+        }
+    }
+}
+
 #[derive(Debug)]
 struct RunState {
     budget: Mutex<Budget>,
+    progress: Mutex<Progress>,
     semaphore: Arc<Semaphore>,
     limiter: Option<Arc<DefaultDirectRateLimiter>>,
     last_used: Mutex<Instant>,
@@ -55,6 +103,7 @@ impl RunState {
                 used_req: 0,
                 used_tok: 0,
             }),
+            progress: Mutex::new(Progress::new(Instant::now())),
             semaphore: Arc::new(Semaphore::new(concurrency)),
             limiter,
             last_used: Mutex::new(Instant::now()),
@@ -91,6 +140,88 @@ impl RunState {
         budget.used_req += 1;
         budget.used_tok = budget.used_tok.saturating_add(tok_need);
         true
+    }
+
+    fn record_planning(
+        &self,
+        counts: PlanningCounts,
+        verbose: bool,
+        label: &str,
+        concurrency: usize,
+    ) {
+        let mut progress = self.progress.lock().unwrap_or_else(|e| e.into_inner());
+        let first_log = progress.rows_seen == 0 && progress.completed == 0;
+        progress.rows_seen = progress.rows_seen.saturating_add(counts.rows_seen);
+        progress.jobs_reserved = progress.jobs_reserved.saturating_add(counts.jobs_reserved);
+        progress.cache_hits = progress.cache_hits.saturating_add(counts.cache_hits);
+        progress.budget_exhausted = progress
+            .budget_exhausted
+            .saturating_add(counts.budget_exhausted);
+        progress.invalid_context = progress
+            .invalid_context
+            .saturating_add(counts.invalid_context);
+        progress.terminal_preserved = progress
+            .terminal_preserved
+            .saturating_add(counts.terminal_preserved);
+
+        let now = Instant::now();
+        let should_log = first_log || now.duration_since(progress.last_log) >= VERBOSE_LOG_INTERVAL;
+        if verbose && should_log {
+            self.log_progress_locked(&mut progress, label, concurrency, "planned");
+        }
+    }
+
+    fn record_completion(&self, ok: bool, verbose: bool, label: &str, concurrency: usize) {
+        let mut progress = self.progress.lock().unwrap_or_else(|e| e.into_inner());
+        progress.completed = progress.completed.saturating_add(1);
+        if ok {
+            progress.ok = progress.ok.saturating_add(1);
+        } else {
+            progress.errors = progress.errors.saturating_add(1);
+        }
+
+        let now = Instant::now();
+        let completion_delta = progress
+            .completed
+            .saturating_sub(progress.last_logged_completed);
+        let finished_known_work =
+            progress.jobs_reserved > 0 && progress.completed >= progress.jobs_reserved;
+        let should_log = completion_delta >= VERBOSE_COMPLETION_INTERVAL
+            || now.duration_since(progress.last_log) >= VERBOSE_LOG_INTERVAL
+            || finished_known_work;
+
+        if verbose && should_log {
+            self.log_progress_locked(&mut progress, label, concurrency, "progress");
+        }
+    }
+
+    fn log_progress_locked(
+        &self,
+        progress: &mut Progress,
+        label: &str,
+        concurrency: usize,
+        phase: &str,
+    ) {
+        let now = Instant::now();
+        let elapsed = now.duration_since(progress.started).as_secs();
+        let waiting = progress.jobs_reserved.saturating_sub(progress.completed);
+        eprintln!(
+            "[polars-ai {label}] {phase}: seen={} queued={} completed={} waiting={} ok={} errors={} cache_hits={} budget_exhausted={} invalid_context={} preserved={} concurrency={} elapsed={}s",
+            progress.rows_seen,
+            progress.jobs_reserved,
+            progress.completed,
+            waiting,
+            progress.ok,
+            progress.errors,
+            progress.cache_hits,
+            progress.budget_exhausted,
+            progress.invalid_context,
+            progress.terminal_preserved,
+            concurrency,
+            elapsed,
+        );
+        progress.last_log = now;
+        progress.last_logged_completed = progress.completed;
     }
 }
 
@@ -161,8 +292,10 @@ pub(crate) fn run_engine(
     let mut out: Vec<Option<ResponseRowParts>> = vec![None; n];
 
     let mut jobs: Vec<(usize, ModelInput, String)> = Vec::new();
+    let mut planning_counts = PlanningCounts::default();
 
     for i in 0..n {
+        planning_counts.rows_seen = planning_counts.rows_seen.saturating_add(1);
         let input = &inputs[i];
         let key = hash_cache_key(model_config, input);
 
@@ -174,6 +307,8 @@ pub(crate) fn run_engine(
             })?;
             if is_terminal(&p_row.status) {
                 out[i] = Some(p_row.clone());
+                planning_counts.terminal_preserved =
+                    planning_counts.terminal_preserved.saturating_add(1);
                 continue;
             }
         }
@@ -198,6 +333,7 @@ pub(crate) fn run_engine(
                 created_at: batch_started.clone(),
                 completed_at: String::new(),
             });
+            planning_counts.invalid_context = planning_counts.invalid_context.saturating_add(1);
             continue;
         }
 
@@ -217,6 +353,7 @@ pub(crate) fn run_engine(
                     created_at: hit.created_at.clone(),
                     completed_at: hit.completed_at.clone(),
                 });
+                planning_counts.cache_hits = planning_counts.cache_hits.saturating_add(1);
                 continue;
             }
         }
@@ -224,6 +361,7 @@ pub(crate) fn run_engine(
         let tok_need = estimate_model_input(input);
         if run_state.try_reserve(max_req_budget, max_tok_budget, tok_need) {
             jobs.push((i, input.clone(), key));
+            planning_counts.jobs_reserved = planning_counts.jobs_reserved.saturating_add(1);
         } else {
             out[i] = Some(ResponseRowParts {
                 status: STAT_BUDGET_EXHAUSTED.into(),
@@ -239,8 +377,12 @@ pub(crate) fn run_engine(
                 created_at: batch_started.clone(),
                 completed_at: String::new(),
             });
+            planning_counts.budget_exhausted = planning_counts.budget_exhausted.saturating_add(1);
         }
     }
+
+    let label = if hydrate { "hydrate" } else { "infer" };
+    run_state.record_planning(planning_counts, kwargs.verbose, label, concurrency);
 
     let cfg: serde_json::Value = serde_json::from_str(model_config).unwrap_or(Value::Null);
     let provider = provider_from_config(&cfg);
@@ -260,6 +402,8 @@ pub(crate) fn run_engine(
                     let run_state = Arc::clone(&run_state);
                     let mc = Arc::clone(&model_cfg_arc);
                     let batch_ts = batch_started.clone();
+                    let label = label;
+                    let verbose = kwargs.verbose;
                     async move {
                         let semaphore = Arc::clone(&run_state.semaphore);
                         let _p = semaphore.acquire_owned().await.ok();
@@ -269,34 +413,40 @@ pub(crate) fn run_engine(
                         let res = prov.call(ctx).await;
                         let done_t = now_iso();
                         let row = match res {
-                            Ok(output) => ResponseRowParts {
-                                status: STAT_OK.into(),
-                                value: Some(output.text),
-                                cache_key: ck,
-                                model_config: (*mc).clone(),
-                                error: None,
-                                attempts: 1,
-                                input_tokens: output.input_tokens,
-                                output_tokens: output.output_tokens,
-                                total_tokens: output.total_tokens,
-                                cost_usd: output.cost_usd,
-                                created_at: batch_ts.clone(),
-                                completed_at: done_t.clone(),
-                            },
-                            Err(e) => ResponseRowParts {
-                                status: STAT_MODEL_ERROR.into(),
-                                value: None,
-                                cache_key: ck,
-                                model_config: (*mc).clone(),
-                                error: Some(e.0),
-                                attempts: 1,
-                                input_tokens: None,
-                                output_tokens: None,
-                                total_tokens: None,
-                                cost_usd: None,
-                                created_at: batch_ts,
-                                completed_at: done_t,
-                            },
+                            Ok(output) => {
+                                run_state.record_completion(true, verbose, label, concurrency);
+                                ResponseRowParts {
+                                    status: STAT_OK.into(),
+                                    value: Some(output.text),
+                                    cache_key: ck,
+                                    model_config: (*mc).clone(),
+                                    error: None,
+                                    attempts: 1,
+                                    input_tokens: output.input_tokens,
+                                    output_tokens: output.output_tokens,
+                                    total_tokens: output.total_tokens,
+                                    cost_usd: output.cost_usd,
+                                    created_at: batch_ts.clone(),
+                                    completed_at: done_t.clone(),
+                                }
+                            }
+                            Err(e) => {
+                                run_state.record_completion(false, verbose, label, concurrency);
+                                ResponseRowParts {
+                                    status: STAT_MODEL_ERROR.into(),
+                                    value: None,
+                                    cache_key: ck,
+                                    model_config: (*mc).clone(),
+                                    error: Some(e.0),
+                                    attempts: 1,
+                                    input_tokens: None,
+                                    output_tokens: None,
+                                    total_tokens: None,
+                                    cost_usd: None,
+                                    created_at: batch_ts,
+                                    completed_at: done_t,
+                                }
+                            }
                         };
                         (idx, row)
                     }

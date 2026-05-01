@@ -42,6 +42,8 @@ pub(crate) struct MapKwargs {
     pub(crate) text_separator: String,
     #[serde(default)]
     pub(crate) number_text_items: bool,
+    #[serde(default = "default_verbose")]
+    pub(crate) verbose: bool,
 }
 
 #[derive(Deserialize, Debug, Clone)]
@@ -58,6 +60,10 @@ fn default_text_separator() -> String {
 
 fn default_input_type() -> String {
     "text".to_string()
+}
+
+fn default_verbose() -> bool {
+    true
 }
 #[derive(Clone, Debug)]
 pub(crate) struct AiContextAtom {
