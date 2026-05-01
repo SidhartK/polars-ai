@@ -16,5 +16,8 @@ examples/__03_data__/
 examples/__03_hydration_cache__/
 examples/__03_cache_demo__/
 examples/__04_cache_demo__/
-examples/__04_airbnb_cache__/
-examples/data/
+examples/__04_airbnb_cache__/*
+!examples/__04_airbnb_cache__/cache_entries.jsonl
+examples/data/*
+!examples/data/airbnb_reviews_full.csv
+
