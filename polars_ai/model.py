@@ -1,83 +1,162 @@
-"""
-polars_ai.model
----------------
-Public AiModel interface and built-in FakeModel.
-
-To integrate a real provider, subclass AiModel and implement
-``model_config``.  The string it returns is passed verbatim as
-``kwargs.model_config`` into the Rust plugin, so pack everything the
-Rust side needs into it as JSON.
-"""
+"""Serializable model config objects used by the Rust execution engine."""
 
 from __future__ import annotations
 
 import json
-from abc import ABC, abstractmethod
-from dataclasses import dataclass
+from dataclasses import dataclass, field
+from typing import Any, Mapping
+
+JsonObject = Mapping[str, Any]
 
 
-class AiModel(ABC):
-    """
-    Abstract base class for all AI model backends.
+def _json_object(value: JsonObject | None, *, field_name: str) -> dict[str, Any]:
+    if value is None:
+        return {}
+    if not isinstance(value, Mapping):
+        raise TypeError(f"`{field_name}` must be a mapping or None")
+    copied = dict(value)
+    try:
+        json.dumps(copied)
+    except TypeError as exc:
+        raise TypeError(f"`{field_name}` must be JSON serializable") from exc
+    return copied
 
-    Subclass this to integrate any provider (OpenAI, Anthropic, Gemini,
-    Ollama, etc.).
-
-    The only required method is ``model_config``, which must return a
-    JSON string that fully describes the invocation.  The Rust plugin
-    deserialises this string to reconstruct whatever parameters it needs
-    when building and dispatching requests.
-
-    Example
-    -------
-    >>> class MyModel(AiModel):
-    ...     def __init__(self, prompt: str):
-    ...         self.prompt = prompt
-    ...     @property
-    ...     def model_config(self) -> str:
-    ...         return json.dumps({"prompt": self.prompt, "endpoint": "..."})
-    """
-
-    @property
-    @abstractmethod
-    def model_config(self) -> str:
-        """Return a JSON string fully describing this model invocation."""
-        ...
-
-
-# ---------------------------------------------------------------------------
-# FakeModel — deterministic, zero network calls, useful for development
-# ---------------------------------------------------------------------------
 
 @dataclass
-class FakeModel(AiModel):
-    """
-    A fake AiModel that returns an f-string incorporating input metadata.
+class Model:
+    """Deterministic provider + prompt + tag config.
 
-    No network calls are made.  The Rust plugin's ``fake_model_call``
-    function uses ``prompt`` and ``tag`` from the serialised config to
-    build a response that is semi-unique per row, making it easy to
-    inspect the output during development.
-
-    Parameters
-    ----------
-    prompt:
-        Template string.  ``{value}`` is replaced with the row's
-        ``_value`` field at response time on the Rust side.
-    tag:
-        Short label included in every response.  Useful for
-        distinguishing outputs from different FakeModel instances
-        when chaining calls.
-
-    Example
-    -------
-    >>> model = FakeModel(prompt="Summarise: {value}", tag="summariser")
-    >>> df.with_columns(pl.col("ctx").ctx.map(model=model).alias("result"))
+    ``Model`` is intentionally data-only. It is not a plugin interface:
+    Rust can only execute providers implemented by the package.
     """
 
-    prompt: str = "Process: {value}"
-    tag:    str = "fake"
+    provider: str
+    name: str
+    prompt: str = "{value}"
+    tag: str = "default"
+    options: JsonObject | None = field(default_factory=dict)
+    pricing: JsonObject | None = None
+
+    def __post_init__(self) -> None:
+        if not self.provider or not self.provider.strip():
+            raise ValueError("`provider` must be a non-empty string")
+        if not self.name or not self.name.strip():
+            raise ValueError("`name` must be a non-empty string")
+        if not self.tag or not self.tag.strip():
+            raise ValueError("`tag` must be a non-empty string")
+        if not isinstance(self.prompt, str):
+            raise TypeError("`prompt` must be a string")
+        self.options = _json_object(self.options, field_name="options")
+        self.pricing = _json_object(self.pricing, field_name="pricing") if self.pricing else None
 
     @property
     def model_config(self) -> str:
-        return json.dumps({"prompt": self.prompt, "tag": self.tag})
+        payload: dict[str, Any] = {
+            "provider": self.provider,
+            "name": self.name,
+            # Kept during the Rust transition; Rust accepts either `name` or `model`.
+            "model": self.name,
+            "prompt": self.prompt,
+            "tag": self.tag,
+            "options": self.options,
+        }
+        if self.pricing is not None:
+            payload["pricing"] = self.pricing
+        return json.dumps(payload, sort_keys=True, separators=(",", ":"))
+
+
+class OpenAIModel(Model):
+    """OpenAI model config executed by the Rust provider layer."""
+
+    def __init__(
+        self,
+        *,
+        name: str,
+        prompt: str = "{value}",
+        tag: str = "openai",
+        options: JsonObject | None = None,
+        pricing: JsonObject | None = None,
+        **provider_options: Any,
+    ) -> None:
+        merged_options = {**_json_object(options, field_name="options"), **provider_options}
+        super().__init__(
+            provider="openai",
+            name=name,
+            prompt=prompt,
+            tag=tag,
+            options=merged_options,
+            pricing=pricing,
+        )
+
+
+class AnthropicModel(Model):
+    """Anthropic model config executed by the Rust provider layer."""
+
+    def __init__(
+        self,
+        *,
+        name: str,
+        prompt: str = "{value}",
+        tag: str = "anthropic",
+        options: JsonObject | None = None,
+        pricing: JsonObject | None = None,
+        **provider_options: Any,
+    ) -> None:
+        merged_options = {**_json_object(options, field_name="options"), **provider_options}
+        super().__init__(
+            provider="anthropic",
+            name=name,
+            prompt=prompt,
+            tag=tag,
+            options=merged_options,
+            pricing=pricing,
+        )
+
+
+class GeminiModel(Model):
+    """Gemini model config executed by the Rust provider layer."""
+
+    def __init__(
+        self,
+        *,
+        name: str,
+        prompt: str = "{value}",
+        tag: str = "gemini",
+        options: JsonObject | None = None,
+        pricing: JsonObject | None = None,
+        **provider_options: Any,
+    ) -> None:
+        merged_options = {**_json_object(options, field_name="options"), **provider_options}
+        super().__init__(
+            provider="gemini",
+            name=name,
+            prompt=prompt,
+            tag=tag,
+            options=merged_options,
+            pricing=pricing,
+        )
+
+
+class FakeModel(Model):
+    """Deterministic local model for examples and tests."""
+
+    def __init__(
+        self,
+        *,
+        name: str = "fake",
+        prompt: str = "Process: {value}",
+        tag: str = "fake",
+        options: JsonObject | None = None,
+        pricing: JsonObject | None = None,
+        **provider_options: Any,
+    ) -> None:
+        merged_options = {**_json_object(options, field_name="options"), **provider_options}
+        super().__init__(
+            provider="fake",
+            name=name,
+            prompt=prompt,
+            tag=tag,
+            options=merged_options,
+            pricing=pricing,
+        )
+
