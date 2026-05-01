@@ -13,10 +13,11 @@ def _():
     from pathlib import Path
 
     import marimo as mo
+    import plotly.graph_objects as go
     import polars as pl
     import polars_ai as pl_ai
 
-    return Path, mo, os, pl, pl_ai
+    return Path, go, mo, os, pl, pl_ai
 
 
 @app.cell
@@ -208,20 +209,6 @@ def _(
 
 
 @app.cell
-def _(first_pass, pl):
-    first_pass.filter(pl.col("ai").struct.field("status") == "ok").select(
-        ((pl.col("review_text").str.len_chars() + 3) / 4).ceil().sum()
-    )
-    return
-
-
-@app.cell
-def _(first_pass, pl):
-    first_pass.filter(pl.col("ai").struct.field("error").is_not_null())
-    return
-
-
-@app.cell
 def _(
     CACHE_DIR,
     HYDRATION_MAX_REQUESTS,
@@ -272,12 +259,6 @@ def _(
 
 
 @app.cell
-def _(hydrated, pl):
-    hydrated.filter(pl.col("ai").struct.field("status") == "model_error")
-    return
-
-
-@app.cell
 def _(
     CACHE_DIR,
     LLM_CLIENT,
@@ -320,12 +301,6 @@ def _(
             ),
         ]
     )
-    return (cache_replay,)
-
-
-@app.cell
-def _(cache_replay, pl):
-    cache_replay.select(pl.col("ai").struct.field("value"))
     return
 
 
@@ -343,6 +318,7 @@ def _(hydrated, mo, pl):
             pl.col("ai")
             .struct.field("value")
             .str.extract(r"(?s)^\s*(?:```(?:json)?\s*)?(\{.*\})\s*(?:```)?\s*$", 1)
+            .str.replace(r"\\", "")
             .str.json_decode(feature_dtype)
             .alias("features")
         )
@@ -386,6 +362,7 @@ def _(mo, pl, scored_reviews):
 
     score_summary = scored_reviews.select(
         pl.col("sentiment_score").mean().alias("avg_sentiment_score"),
+        pl.col("sentiment_score").std().alias("std_sentiment_score"),
         pl.col("sentiment_score").median().alias("median_sentiment_score"),
         pl.col("weather_enjoyment_score").mean().alias("avg_weather_enjoyment_score"),
         pl.col("weather_enjoyment_score").median().alias(
@@ -405,12 +382,155 @@ def _(mo, pl, scored_reviews):
 
     mo.vstack(
         [
-            mo.md("## Aggregate the extracted features"),
-            score_summary,
             mo.md("### AI response statuses"),
             status_counts,
+            mo.md("## Aggregate the extracted features"),
+            score_summary,
+            mo.md("### Reviews sorted by sentiment (bad to good)"),
+            scored_reviews.sort("sentiment_score"),
             mo.md("### Reviews where the model found weather evidence"),
-            weather_mentions.head(20),
+            weather_mentions.sort("weather_enjoyment_score"),
+        ]
+    )
+    return
+
+
+@app.cell
+def _(go, mo, pl, scored_reviews):
+    listing_sentiment = (
+        scored_reviews
+        .filter(
+            pl.col("ai_status").is_in(["ok", "cache_hit"])
+            & pl.col("sentiment_score").is_not_null()
+        )
+        .group_by("listing_id")
+        .agg(
+            pl.len().alias("review_count"),
+            pl.col("sentiment_score").mean().alias("avg_sentiment_score"),
+            pl.col("date").quantile(0.25).alias("q25_review_date"),
+            pl.col("date").quantile(0.75).alias("q75_review_date"),
+        )
+        .filter(pl.col("review_count") >= 5)
+        .with_columns(
+            (pl.col("q75_review_date") - pl.col("q25_review_date"))
+                .dt.total_days()
+                .alias("review_window_days")
+        )
+        .filter(pl.col("review_window_days") > 0)
+        # .with_columns(
+        #     pl.col("review_window_days").log().alias("log_review_window_days")
+        # )
+        .sort("review_count", descending=True)
+    )
+
+    listing_sentiment_scatter = go.Figure()
+    listing_sentiment_scatter.add_trace(
+        go.Scatter(
+            x=listing_sentiment["review_window_days"].to_list(),
+            y=listing_sentiment["avg_sentiment_score"].to_list(),
+            mode="markers",
+            # marker=dict(
+            #     size=listing_sentiment["review_count"].clip(upper_bound=40).to_list(),
+            #     opacity=0.65,
+            # ),
+            text=listing_sentiment["listing_id"].cast(pl.String).to_list(),
+            customdata=list(
+                zip(
+                    listing_sentiment["review_count"].to_list(),
+                    listing_sentiment["review_window_days"].to_list(),
+                    listing_sentiment["q25_review_date"].cast(pl.String).to_list(),
+                    listing_sentiment["q75_review_date"].cast(pl.String).to_list(),
+                )
+            ),
+            hovertemplate=(
+                "Listing=%{text}<br>"
+                "Avg sentiment=%{y:.3f}<br>"
+                "days q75-q25=%{x:.3f}<br>"
+                "Review count=%{customdata[0]}<br>"
+                "Window days=%{customdata[1]}<br>"
+                "q25=%{customdata[2]}<br>"
+                "q75=%{customdata[3]}"
+                "<extra></extra>"
+            ),
+        )
+    )
+    listing_sentiment_scatter.update_layout(
+        title="Listing Sentiment vs. Review Date Spread",
+        xaxis_title="q75 review date - q25 review date",
+        yaxis_title="Average sentiment score",
+        xaxis=dict(type='log'),
+        yaxis=dict(range=[-1, 1]),
+        margin=dict(l=40, r=20, t=60, b=40),
+    )
+
+    mo.vstack(
+        [
+            mo.md("## Listing sentiment by review date spread"),
+            mo.ui.plotly(listing_sentiment_scatter),
+            listing_sentiment,
+        ]
+    )
+    return
+
+
+@app.cell
+def _(go, mo, pl, scored_reviews):
+    monthly_sentiment = (
+        scored_reviews
+        .filter(
+            pl.col("ai_status").is_in(["ok", "cache_hit"])
+            & pl.col("sentiment_score").is_not_null()
+            & pl.col("weather_enjoyment_score").is_not_null()
+        )
+        .with_columns(pl.col("date").dt.strftime("%m").alias("review_month"))
+        .group_by("review_month", maintain_order=True)
+        .agg(
+            pl.col("sentiment_score").mean().alias("avg_sentiment_score"),
+            pl.col("weather_enjoyment_score").mean().alias("avg_weather_enjoyment_score"),
+            pl.len().alias("review_count"),
+        )
+        .sort("review_month")
+    )
+
+    sentiment_trend = go.Figure()
+    sentiment_trend.add_trace(
+        go.Scatter(
+            x=monthly_sentiment["review_month"].to_list(),
+            y=monthly_sentiment["avg_sentiment_score"].to_list(),
+            mode="lines+markers",
+            name="Average sentiment",
+            hovertemplate="Month=%{x}<br>Avg sentiment=%{y:.3f}<extra></extra>",
+        )
+    )
+    sentiment_trend.add_trace(
+        go.Scatter(
+            x=monthly_sentiment["review_month"].to_list(),
+            y=monthly_sentiment["avg_weather_enjoyment_score"].to_list(),
+            mode="lines+markers",
+            name="Average weather sentiment",
+            hovertemplate="Month=%{x}<br>Avg weather sentiment=%{y:.3f}<extra></extra>",
+        )
+    )
+    sentiment_trend.update_layout(
+        title="Average Airbnb Review Sentiment by Month",
+        xaxis_title="Review month",
+        yaxis_title="Average score (-1 to 1)",
+        yaxis=dict(range=[-1, 1]),
+        hovermode="x unified",
+        legend=dict(orientation="h", yanchor="bottom", y=1.02, xanchor="left", x=0),
+        margin=dict(l=40, r=20, t=80, b=40),
+    )
+
+    mo.vstack(
+        [
+            mo.md("## Monthly sentiment trends"),
+            mo.md(
+                "This chart aggregates completed review scores by review month, "
+                "making it easier to compare overall guest sentiment against "
+                "weather-specific sentiment over time."
+            ),
+            mo.ui.plotly(sentiment_trend),
+            monthly_sentiment,
         ]
     )
     return
