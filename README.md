@@ -18,11 +18,12 @@ For a guided setup, see [`QUICKSTART.md`](QUICKSTART.md).
 polars_ai/
 ├── Cargo.toml              Rust dependencies
 ├── pyproject.toml          Python build config (maturin)
-├── QUICKSTART.md           guided setup and first notebook
+├── QUICKSTART.md           guided setup and notebook sequence
 ├── examples/
-│   ├── 01_quickstart.py              marimo quickstart
-│   ├── 02_model_parameters_and_hydration.py   map/hydrate knobs
-│   ├── 03_cache_back_to_back_and_hydrate.py   disk cache narrative
+│   ├── 01_contexts_and_batches.py          context atoms and batches
+│   ├── 02_map_operations.py                vanilla map operations
+│   ├── 03_hydration_real_dataset.py        hydration with real text data
+│   ├── 04_caching_and_reproducibility.py   disk cache replay
 │   └── static/
 │       └── example.jpg     sample image used by the notebook
 ├── src/
@@ -49,8 +50,8 @@ pip install maturin
 # 3. Compile the Rust plugin and install it into the venv
 maturin develop --extras examples
 
-# 4. Open the quickstart notebook
-marimo edit examples/01_quickstart.py
+# 4. Open the first notebook
+marimo edit examples/01_contexts_and_batches.py
 ```
 
 `maturin develop` must be re-run every time you edit `src/lib.rs`.
@@ -147,18 +148,14 @@ Clear the cache folder to force fresh calls while keeping deterministic keys for
 
 `pl.col("ctx").ctx.cache_key(model=my_model)` materializes each row's stable fingerprint so you can join, duplicate-check, or prefill cache metadata without calling the provider.
 
-## What the marimo notebook covers
+## What the marimo notebooks cover
 
-[`examples/01_quickstart.py`](examples/01_quickstart.py):
+The examples are ordered as a four-notebook learning path:
 
-1. `pl_ai.text_context()` and **`is_context_dtype`**
-2. `.ctx.preview()` / `.ctx.estimate_tokens()`
-3. `.ctx.map` → **`AiResponse`**, unpacked with `.ai.value()` / `.ai.status()`
-4. Budget demo (`max_requests`) and hydrate to finish partial runs
-5. Chained maps (each step wraps **`.ai.value()`** before the next `text_context`)
-6. Image context struct inspection
-7. Optional OpenAI-backed cells (`OPENAI_API_KEY`)
-8. `pl_ai.context()` convenience helper
+1. [`examples/01_contexts_and_batches.py`](examples/01_contexts_and_batches.py) introduces `AiModelContext`, `ContextBatch`, `.ctx.preview()`, `.ctx.estimate_tokens()`, `.ctx.batch()`, and `.ctxbatch.reduce_text(...)`.
+2. [`examples/02_map_operations.py`](examples/02_map_operations.py) introduces `.ctx.map(...)`, `.ctxbatch.map(...)`, `AiResponse` accessors, budgets, chained maps, and cache-key preflight checks.
+3. [`examples/03_hydration_real_dataset.py`](examples/03_hydration_real_dataset.py) uses the UCI SMS Spam Collection to show partial runs and `.ai.hydrate(...)` on `budget_exhausted` rows.
+4. [`examples/04_caching_and_reproducibility.py`](examples/04_caching_and_reproducibility.py) shows `cache=True`, replaying rows as `cache_hit` after rebuilding the dataframe, cache misses for changed inputs, and hydrate-with-cache.
 
 ## Extending with a real model
 

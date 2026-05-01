@@ -1,6 +1,6 @@
 # Quickstart
 
-Install `polars-ai` locally and open [`examples/01_quickstart.py`](examples/01_quickstart.py), a marimo notebook that walks through context atoms, context batches, **`AiResponse`** structs (`.ai.*` accessors), budgets, hydrate, caching, and optional OpenAI.
+Install `polars-ai` locally and open [`examples/01_contexts_and_batches.py`](examples/01_contexts_and_batches.py), the first marimo notebook in a four-part sequence covering context atoms, context batches, map operations, hydration, and caching.
 
 ## Prerequisites
 
@@ -32,21 +32,15 @@ You can optionally install dev tooling (pytest, ruff, …) via `pip install -e "
 ## Open the notebook
 
 ```bash
-marimo edit examples/01_quickstart.py
+marimo edit examples/01_contexts_and_batches.py
 ```
 
-## What you will practice
+## Notebook sequence
 
-1. **`pl_ai.text_context()`** (`AiModelContext` struct columns) and **`pl_ai.is_context_dtype()`**
-2. **`.ctx.preview()`** / **`.ctx.estimate_tokens()`** (pure Polars helpers)
-3. **`.ctx.map(model=..., max_requests=..., max_tokens=..., cache=...)`** returning **`AiResponse`**
-4. **`.ctx.batch()`** and **`.ctxbatch.reduce_text()`** for grouped prompts
-5. **`.ctxbatch.map(...)`** for one model call per context batch when the provider supports it
-6. **`.ai.value()`**, **`.ai.status()`**, **`.ai.cache_key()`** on mapped columns
-7. **Hydration**: **`.ai.hydrate(ctx=..., model=..., ...budgets)`** to finish **`budget_exhausted`** rows
-8. Chaining pipelines: rebuild context from **`.ai.to_context()`** between stages
-9. Image contexts (`pl_ai.image_context`) and **`pl_ai.context()`**
-10. Optional OpenAI cells when **`OPENAI_API_KEY`** is set
+1. [`examples/01_contexts_and_batches.py`](examples/01_contexts_and_batches.py): create and inspect **`AiModelContext`** values, group them into **`ContextBatch`** values, and reduce batches back to text contexts.
+2. [`examples/02_map_operations.py`](examples/02_map_operations.py): map context columns into **`AiResponse`** structs, unpack `.ai.*` fields, use budgets, chain maps, and map grouped batches.
+3. [`examples/03_hydration_real_dataset.py`](examples/03_hydration_real_dataset.py): use a small UCI SMS Spam Collection sample to stop a run with `budget_exhausted` rows and finish it with **`.ai.hydrate(...)`**.
+4. [`examples/04_caching_and_reproducibility.py`](examples/04_caching_and_reproducibility.py): warm a disk cache, rebuild the dataframe, replay cached rows with `max_requests=0`, and hydrate cache misses.
 
 ## Behavioral notes
 
@@ -54,11 +48,6 @@ marimo edit examples/01_quickstart.py
 - **Cache folder:** Relative **`./__polars_ai_cache__`** unless you override **`cache_path`**. Cached hits report **`RESPONSE_STATUS_CACHE_HIT`**.
 - **Context state:** atoms are stored as `Struct`; batches are stored as `List[Struct]`; rendered provider content is internal to model invocation.
 
-## Optional OpenAI cells
+## Provider calls
 
-```bash
-export OPENAI_API_KEY=...
-marimo edit examples/01_quickstart.py
-```
-
-Without an API key, the notebook skips live calls and relies on **`FakeModel`**.
+The notebooks rely on **`FakeModel`** by default, so no provider API key is required.
